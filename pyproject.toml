@@ -25,7 +25,13 @@ classifiers = [
     "Typing :: Typed",
 ]
 dynamic = ["version"]
-dependencies = []
+dependencies = [
+    "torch",
+    "mrcfile",
+    "einops",
+    "mmdf",
+    "libtilt",
+]
 
 # extras
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
@@ -41,6 +47,10 @@ dev = [
     "pytest",
     "rich",
     "ruff",
+]
+vis = [
+    "napari",
+    "matplotlib",
 ]
 
 [project.urls]
