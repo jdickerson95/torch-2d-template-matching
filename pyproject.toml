@@ -27,6 +27,7 @@ classifiers = [
 dynamic = ["version"]
 dependencies = [
     "torch",
+    "scipy",
     "mrcfile",
     "einops",
     "mmdf",
