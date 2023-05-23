@@ -31,6 +31,7 @@ dependencies = [
     "einops",
     "mmdf",
     "libtilt",
+    "h3",
 ]
 
 # extras
