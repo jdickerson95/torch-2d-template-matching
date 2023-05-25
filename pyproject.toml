@@ -33,6 +33,7 @@ dependencies = [
     "mmdf",
     "libtilt",
     "h3",
+    "starfile",
 ]
 
 # extras
