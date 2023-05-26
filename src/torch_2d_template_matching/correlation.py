@@ -1,8 +1,9 @@
 import torch
 
+
 def cross_correlate(
-        exp_images:torch.Tensor,
-        projection_images:torch.Tensor,
+        exp_images: torch.Tensor,
+        projection_images: torch.Tensor,
 ):
     # at the moment, there is nothing about what to store
     image_dft = torch.fft.rfftn(exp_images, dim=(-2, -1))

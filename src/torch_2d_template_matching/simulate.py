@@ -40,21 +40,29 @@ def place_in_volume(
     for i, idx in enumerate(random_indices):
         rotation_matrices[i] = h3_to_rotation_matrix(h3_grid[idx])
     # rotate the atoms to these
-    print(type(rotation_matrices))
-    print(type(atom_zyx))
     rotated_atom_zyx = torch.matmul(atom_zyx, rotation_matrices)
+    '''
+    rotation_matrices = einops.rearrange(rotation_matrices, '... i j -> ... 1 i j')
+    atom_zyx = einops.rearrange(atom_zyx, 'n coords -> n coords 1')
+    rotated_atom_zyx = rotation_matrices @ atom_zyx
+    rotated_atom_zyx = einops.rearrange(rotated_atom_zyx, '... n coords 1 -> ... n coords')
+    '''
     print(rotated_atom_zyx.shape)
     # Place these in a 3D volume
     print("placing particles in 3D volume")
     # I'm placing in z, but I am going to apply the same ctf to them all
     # so they will all have the same defocus
     volume_shape = (image_shape[0] // 3, *image_shape)
+    # I think things off the edge was causing an issue
+    # volume_shape = (image_shape[0] // 3, image_shape[0]-image_shape[0]/5, image_shape[1]-image_shape[1]/5)
     pz, py, px = [
         np.random.uniform(low=0, high=dim_length, size=num_particles)
         for dim_length in volume_shape
     ]
     particle_positions = einops.rearrange([pz, py, px], 'zyx b -> b 1 zyx')
+    print(particle_positions.shape)
     particle_atom_positions = rotated_atom_zyx + particle_positions
+    print(particle_atom_positions.shape)
     return particle_atom_positions
 
 
@@ -106,11 +114,12 @@ def apply_ctf(
 
 
 def main():
-    n_particles = 5
+    n_particles = 30
     sim_pixel_spacing = 1
     sim_image_shape = (4096, 4096)
     defocus = -1.0  # microns
-    file_path = "/Users/josh/git/torch-2d-template-matching/data/4v6x-ribo.cif"
+    file_path = "/Users/josh/git/torch-2d-template-matching/data/7qn5.pdb"
+    # file_path = "/Users/josh/git/torch-2d-template-matching/data/4v6x-ribo.cif"
     atom_zyx = load_model(file_path, 1.0)
     print(atom_zyx.shape)
     all_particle_atom_positions = place_in_volume(n_particles, atom_zyx, sim_image_shape)
@@ -124,6 +133,8 @@ def main():
         image_shape=sim_image_shape,
         pixel_size=sim_pixel_spacing
     )
+
+    '''
     # view this in napari to make sure it's okay
     viewer = napari.Viewer()
     viewer.add_image(
@@ -132,7 +143,10 @@ def main():
         contrast_limits=(0, torch.max(sim_image_final))
     )
     napari.run()
+    '''
+    return sim_image_final
 
-
+'''
 if __name__ == "__main__":
     main()
+'''

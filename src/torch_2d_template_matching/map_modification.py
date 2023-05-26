@@ -25,12 +25,12 @@ def apply_b_map(
         image_shape=volume_map.shape[-3:],
         pixel_size=pixel_size,
         rfft=True,
-        fftshifted=False,
+        fftshift=False,
 
     )
     #Apply
     return apply_filter_3d(
-        map=volume_map,
+        volume_map=volume_map,
         filter=b_env,
     )
 

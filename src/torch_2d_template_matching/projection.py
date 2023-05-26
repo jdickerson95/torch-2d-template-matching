@@ -4,7 +4,7 @@
 import einops
 import torch
 import torch.nn.functional as F
-from libtilt.projection import project_fourier
+from libtilt.projection.project_fourier import project_in_fourier_space
 from libtilt.ctf.relativistic_wavelength import calculate_relativistic_electron_wavelength
 from libtilt.ctf.ctf_2d import calculate_ctf
 
@@ -27,6 +27,7 @@ def calculate_box_padding(
     pad_distance += pad_distance%2  # make it even
     return pad_distance
 
+
 def pad_to_shape(
         image: torch.Tensor,
         image_shape: tuple[int,int],
@@ -39,13 +40,12 @@ def pad_to_shape(
     return padded_image
 
 
-
 def project_reference(
         volume_map: torch.Tensor,
         rotation_matrices: torch.Tensor,
         defoci: torch.Tensor,
-        full_size: tuple[int,int],
-        pixel_size = float,
+        full_size: tuple[int, int],
+        pixel_size: float,
         beam_energy: float = 300000,
         astigmatism: float = 0,
         astigmatism_angle: float = 0,
@@ -60,7 +60,7 @@ def project_reference(
     # for now with a possibility of changing later
 
     # project the map
-    projection_images = project_fourier(
+    projection_images = project_in_fourier_space(
         volume=volume_map,
         rotation_matrices=rotation_matrices,
     )
@@ -81,7 +81,7 @@ def project_reference(
     padded_projections = F.pad(projection_images, p2d, "constant", 0)
     # calculate a ctf of this size
     # I want negative defocus to be underfocus so flip the sign
-    image_shape = padded_projections.shape()
+    image_shape = padded_projections.shape[-2:]
     ctf = calculate_ctf(
             defocus=(defoci*-1),
             astigmatism=astigmatism,
@@ -100,6 +100,7 @@ def project_reference(
     dft_projections = torch.fft.rfftn(padded_projections, dim=(-2, -1))
     ctf = einops.rearrange(ctf, 'b h w -> b 1 h w')
     ctf_dft_projection = dft_projections * ctf
+    # would want to do the whitening filter here at this stage
     defocused_projections = torch.real(torch.fft.irfftn(ctf_dft_projection, dim=(-2, -1)))
     # pad the reference image to full size
     # again might be easier to sum to zero array of correct size
