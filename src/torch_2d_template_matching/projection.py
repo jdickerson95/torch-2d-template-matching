@@ -110,6 +110,7 @@ def project_reference(
         shape=full_size,
     )
     # fft shift to the edge
+
     reference_images = torch.fft.fftshift(reference_images, dim=(-2, -1))
     # return these projection images
     return reference_images

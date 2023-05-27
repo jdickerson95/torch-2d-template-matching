@@ -18,7 +18,7 @@ import correlation
 def main():
     # get inputs
     # load mrc
-    sim_image_shape = (4096, 4096)
+    sim_image_shape = (2048, 2048)
     pixel_size = 1.0
     mrc_filepath = "/Users/josh/git/torch-2d-template-matching/data/7qn5.mrc"
     mrc_map = test_io.load_mrc_map(mrc_filepath)
@@ -31,13 +31,31 @@ def main():
     rotation_matrices = torch.zeros((len(h3_grid), 3, 3))
     for i, h in enumerate(h3_grid):
         rotation_matrices[i] = so3_grid.h3_to_rotation_matrix(h)
-    defoci = torch.arange(-1.4, -0.6, 0.2)
+    defoci = torch.arange(-1.2, -0.8, 0.2)
     projections = projection.project_reference(mrc_map, rotation_matrices, defoci, sim_image_shape, pixel_size)
     # load images or make simulated image
     sim_images = simulate.main()
     # do correlation
+    print(f"projections:{projections.shape}")
+    print(f"sim_images:{sim_images.shape}")
+    print("starting xcorr")
     xcorr = correlation.cross_correlate(sim_images, projections)
     print('test')
+    viewer = napari.Viewer()
+    viewer.add_image(
+        sim_images.numpy(),
+        name='sim_images',
+        contrast_limits=(0, torch.max(sim_images))
+    )
+    viewer.add_image(
+        xcorr.numpy(),
+        name='template matching result',
+        contrast_limits=(0, torch.max(xcorr)),
+        colormap='inferno',
+        blending='additive',
+        opacity=0.3,
+    )
+    napari.run()
 
 
 if __name__ == "__main__":

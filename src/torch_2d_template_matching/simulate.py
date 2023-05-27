@@ -116,7 +116,7 @@ def apply_ctf(
 def main():
     n_particles = 30
     sim_pixel_spacing = 1
-    sim_image_shape = (4096, 4096)
+    sim_image_shape = (2048, 2048)
     defocus = -1.0  # microns
     file_path = "/Users/josh/git/torch-2d-template-matching/data/7qn5.pdb"
     # file_path = "/Users/josh/git/torch-2d-template-matching/data/4v6x-ribo.cif"
