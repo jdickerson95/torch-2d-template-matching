@@ -10,6 +10,7 @@ from libtilt.interpolation import insert_into_image_2d
 from libtilt.ctf.ctf_2d import calculate_ctf
 from so3_grid import get_h3_grid_at_resolution
 from so3_grid import h3_to_rotation_matrix
+from eulerangles import matrix2euler
 import napari
 
 
@@ -27,18 +28,39 @@ def load_model(
 def place_in_volume(
         num_particles: int,
         atom_zyx: torch.Tensor,
-        image_shape: tuple[int, int]
+        image_shape: tuple[int, int],
+        phi: float,
+        theta: float,
+        psi: float
 ):
     # here I get H3 grid at a particular resolution
     h3_res = 0  # 0 to restrict space for testing
     h3_grid = get_h3_grid_at_resolution(0)
-    # Take n random points on the grid
-    weights = torch.ones((len(h3_grid)))  # Use even weights
+    rotation_matrices_all = torch.zeros((len(h3_grid), 3, 3))
+    for i, h in enumerate(h3_grid):
+        rotation_matrices_all[i] = h3_to_rotation_matrix(h)
+    # convert to euler
+    euler_angles = matrix2euler(rotation_matrices_all,
+                                axes='zyz',
+                                intrinsic=True,
+                                right_handed_rotation=True)
+    # only search in euler angle range
+    indices = np.argwhere(
+        (phi[0] <= euler_angles[:, 0]) & (euler_angles[:, 0] < phi[1]) & (theta[0] <= euler_angles[:, 1])
+        & (euler_angles[:, 1] < theta[1]) & (psi[0] <= euler_angles[:, 2]) & (euler_angles[:, 2] < psi[1]))
+    indices = np.reshape(indices, (-1,))
+    rotation_matrices_all = rotation_matrices_all[indices]
+
+    # Take n random matrices
+    weights = torch.ones(rotation_matrices_all.shape[0])  # Use even weights
+    # I would ideally set these to 0
     random_indices = torch.multinomial(weights, num_particles, replacement=True)  # replace so same orientation can
     # convert to rotation matrices
     rotation_matrices = torch.zeros((num_particles, 3, 3))
     for i, idx in enumerate(random_indices):
+
         rotation_matrices[i] = h3_to_rotation_matrix(h3_grid[idx])
+
     # rotate the atoms to these
     rotated_atom_zyx = torch.matmul(atom_zyx, rotation_matrices)
     '''
@@ -113,16 +135,29 @@ def apply_ctf(
     return sim_image_ctf
 
 
-def main():
+def main(
+        phi: tuple[float, float],
+        theta: tuple[float, float],
+        psi: tuple[float, float],
+        sim_image_shape: tuple[int, int],
+        sim_pixel_spacing: float
+):
     n_particles = 30
-    sim_pixel_spacing = 1
-    sim_image_shape = (2048, 2048)
+    # sim_pixel_spacing = 1
+    # sim_image_shape = (2048, 2048)
     defocus = -1.0  # microns
     file_path = "/Users/josh/git/torch-2d-template-matching/data/7qn5.pdb"
     # file_path = "/Users/josh/git/torch-2d-template-matching/data/4v6x-ribo.cif"
     atom_zyx = load_model(file_path, 1.0)
     print(atom_zyx.shape)
-    all_particle_atom_positions = place_in_volume(n_particles, atom_zyx, sim_image_shape)
+    all_particle_atom_positions = place_in_volume(
+        num_particles=n_particles,
+        atom_zyx=atom_zyx,
+        image_shape=sim_image_shape,
+        phi=phi,
+        theta=theta,
+        psi=psi
+    )
     sim_image_no_ctf = simulate_image(
         per_particle_atom_positions=all_particle_atom_positions,
         image_shape=sim_image_shape
@@ -145,6 +180,7 @@ def main():
     napari.run()
     '''
     return sim_image_final
+
 
 '''
 if __name__ == "__main__":

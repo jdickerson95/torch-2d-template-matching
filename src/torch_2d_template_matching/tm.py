@@ -5,6 +5,7 @@ import mmdf
 import numpy as np
 import torch
 import napari
+from eulerangles import matrix2euler
 
 from libtilt.interpolation import insert_into_image_2d
 
@@ -15,15 +16,21 @@ import test_io
 import simulate
 import correlation
 
+
 def main():
-    # get inputs
+    # get inputs, still need to do this
+    B = 50
+    # euler angle range so user can restrict range, agian will be a user input
+    phi = (-180, 180)
+    theta = (-45, 45)
+    psi = (-180, 180)
     # load mrc
     sim_image_shape = (2048, 2048)
     pixel_size = 1.0
     mrc_filepath = "/Users/josh/git/torch-2d-template-matching/data/7qn5.mrc"
     mrc_map = test_io.load_mrc_map(mrc_filepath)
     # apply any filters to the model
-    B = 50
+
     mrc_map = map_modification.apply_b_map(mrc_map, B, 1.0)
     # project model
     res = 0
@@ -31,10 +38,27 @@ def main():
     rotation_matrices = torch.zeros((len(h3_grid), 3, 3))
     for i, h in enumerate(h3_grid):
         rotation_matrices[i] = so3_grid.h3_to_rotation_matrix(h)
+    # convert to euler
+    euler_angles = matrix2euler(rotation_matrices,
+                                axes='zyz',
+                                intrinsic=True,
+                                right_handed_rotation=True)
+    # only search in euler angle range
+    indices = np.argwhere(
+        (phi[0] <= euler_angles[:, 0]) & (euler_angles[:, 0] < phi[1]) & (theta[0] <= euler_angles[:, 1])
+        & (euler_angles[:, 1] < theta[1]) & (psi[0] <= euler_angles[:, 2]) & (euler_angles[:, 2] < psi[1]))
+    indices = np.reshape(indices, (-1,))
+    rotation_matrices = rotation_matrices[indices]
     defoci = torch.arange(-1.2, -0.8, 0.2)
     projections = projection.project_reference(mrc_map, rotation_matrices, defoci, sim_image_shape, pixel_size)
     # load images or make simulated image
-    sim_images = simulate.main()
+    sim_images = simulate.main(
+        phi=phi,
+        theta=theta,
+        psi=psi,
+        sim_image_shape=sim_image_shape,
+        sim_pixel_spacing=pixel_size
+    )
     # do correlation
     print(f"projections:{projections.shape}")
     print(f"sim_images:{sim_images.shape}")
