@@ -12,6 +12,7 @@ from so3_grid import get_h3_grid_at_resolution
 from so3_grid import h3_to_rotation_matrix
 from eulerangles import matrix2euler
 import napari
+from scipy.spatial.transform import Rotation as R
 
 
 def load_model(
@@ -58,17 +59,20 @@ def place_in_volume(
     # convert to rotation matrices
     rotation_matrices = torch.zeros((num_particles, 3, 3))
     for i, idx in enumerate(random_indices):
-
         rotation_matrices[i] = h3_to_rotation_matrix(h3_grid[idx])
 
     # rotate the atoms to these
-    rotated_atom_zyx = torch.matmul(atom_zyx, rotation_matrices)
-    '''
+    # rotated_atom_zyx = torch.matmul(atom_zyx, rotation_matrices)
+
     rotation_matrices = einops.rearrange(rotation_matrices, '... i j -> ... 1 i j')
-    atom_zyx = einops.rearrange(atom_zyx, 'n coords -> n coords 1')
-    rotated_atom_zyx = rotation_matrices @ atom_zyx
-    rotated_atom_zyx = einops.rearrange(rotated_atom_zyx, '... n coords 1 -> ... n coords')
-    '''
+    print(atom_zyx[0])
+    atom_xyz = torch.flip(atom_zyx, [1])
+    print(atom_xyz[0])
+    atom_xyz = einops.rearrange(atom_xyz, 'n coords -> n coords 1')
+    rotated_atom_xyz = rotation_matrices @ atom_xyz
+    rotated_atom_xyz = einops.rearrange(rotated_atom_xyz, '... n coords 1 -> ... n coords')
+    rotated_atom_zyx = torch.flip(rotated_atom_xyz, [1])
+
     print(rotated_atom_zyx.shape)
     # Place these in a 3D volume
     print("placing particles in 3D volume")
@@ -93,6 +97,7 @@ def simulate_image(
         image_shape: tuple[int, int]
 ):
     print("simulating image without ctf applied")
+    print(f"atom pos: {per_particle_atom_positions.shape}")
     atom_yx = per_particle_atom_positions[..., 1:]
     atom_yx = einops.rearrange(atom_yx, 'particles atoms yx -> (particles atoms) yx')
     n_atoms = atom_yx.shape[0]
@@ -142,7 +147,7 @@ def main(
         sim_image_shape: tuple[int, int],
         sim_pixel_spacing: float
 ):
-    n_particles = 30
+    n_particles = 20
     # sim_pixel_spacing = 1
     # sim_image_shape = (2048, 2048)
     defocus = -1.0  # microns
