@@ -22,7 +22,7 @@ def main():
     B = 50
     # euler angle range so user can restrict range, agian will be a user input
     phi = (-180, 180)
-    theta = (-45, 45)
+    theta = (-90, 90)
     psi = (-180, 180)
     # load mrc
     sim_image_shape = (2048, 2048)

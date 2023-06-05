@@ -2,6 +2,7 @@ import h3
 import torch
 import einops
 from scipy.spatial.transform import Rotation as R
+from eulerangles import invert_rotation_matrices
 
 
 def get_h3_grid_at_resolution(resolution: int) -> list[str]:
@@ -80,9 +81,9 @@ def h3_to_rotation_matrix(h: str) -> torch.Tensor:
     rotation_matrix[:, 0] = x
     rotation_matrix[:, 1] = y
     rotation_matrix[:, 2] = z
+
+    rotation_matrix = invert_rotation_matrices(rotation_matrix)
     return rotation_matrix
-
-
 
 
 def h3_to_xyz(h: str):
