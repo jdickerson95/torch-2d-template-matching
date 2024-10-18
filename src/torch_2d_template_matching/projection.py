@@ -4,7 +4,7 @@
 import einops
 import torch
 import torch.nn.functional as F
-from libtilt.projection.project_fourier import project_in_fourier_space
+from libtilt.projection.project_fourier import project_fourier
 from libtilt.ctf.relativistic_wavelength import calculate_relativistic_electron_wavelength
 from libtilt.ctf.ctf_2d import calculate_ctf
 
@@ -60,9 +60,11 @@ def project_reference(
     # for now with a possibility of changing later
 
     # project the map
-    projection_images = project_in_fourier_space(
+    projection_images = project_fourier(
         volume=volume_map,
         rotation_matrices=rotation_matrices,
+        rotation_matrix_zyx=True,
+        pad=True
     )
     # calculate the CTF. size of CTF will depend on how much need to pad image
     # I think pad to make sure Nyquist is still in the box

@@ -31,7 +31,7 @@ def main():
     mrc_map = test_io.load_mrc_map(mrc_filepath)
     # apply any filters to the model
 
-    mrc_map = map_modification.apply_b_map(mrc_map, B, 1.0)
+    mrc_map = map_modification.apply_b_map(mrc_map, B, pixel_size)
     # project model
     res = 0
     h3_grid = so3_grid.get_h3_grid_at_resolution(res)
@@ -65,6 +65,7 @@ def main():
     print("starting xcorr")
     xcorr = correlation.cross_correlate(sim_images, projections)
     print('test')
+    
     viewer = napari.Viewer()
     viewer.add_image(
         sim_images.numpy(),
@@ -80,7 +81,7 @@ def main():
         opacity=0.3,
     )
     napari.run()
-
+    
 
 if __name__ == "__main__":
     main()
