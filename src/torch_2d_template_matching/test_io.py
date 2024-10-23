@@ -4,7 +4,7 @@ import torch
 import mmdf
 
 
-def load_mrc_map(
+def load_mrc(
         file_path: str
 ):
     with mrcfile.open(file_path) as mrc:

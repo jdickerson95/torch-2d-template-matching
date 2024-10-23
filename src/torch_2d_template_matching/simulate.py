@@ -11,7 +11,7 @@ from libtilt.ctf.ctf_2d import calculate_ctf
 from so3_grid import get_h3_grid_at_resolution
 from so3_grid import h3_to_rotation_matrix
 from eulerangles import matrix2euler
-import napari
+#import napari
 from scipy.spatial.transform import Rotation as R
 
 
