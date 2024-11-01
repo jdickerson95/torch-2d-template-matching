@@ -8,8 +8,8 @@ import torch
 import mmdf
 from libtilt.interpolation import insert_into_image_2d
 from libtilt.ctf.ctf_2d import calculate_ctf
-from so3_grid import get_h3_grid_at_resolution
-from so3_grid import h3_to_rotation_matrix
+from torch_2d_template_matching.so3_grid import get_h3_grid_at_resolution
+from torch_2d_template_matching.so3_grid import h3_to_rotation_matrix
 from eulerangles import matrix2euler
 #import napari
 from scipy.spatial.transform import Rotation as R

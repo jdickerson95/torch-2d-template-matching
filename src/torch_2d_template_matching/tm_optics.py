@@ -18,6 +18,7 @@ def main():
     #Take input can easily make this multiple
     simulated_image = sys.argv[1]
     simulated_projection = sys.argv[2]
+    outfile_name = sys.argv[3]
     do_whiten = True
     bp_low = 1/99
     bp_high = 1/10
@@ -69,6 +70,8 @@ def main():
     #write this
     with mrcfile.new('test_xcorr_sim.mrc', overwrite=True) as mrc:
         mrc.set_data(SNR_all.detach().numpy())
+    
+    print(torch.max(SNR_all).item())
     
     
 if __name__ == "__main__":

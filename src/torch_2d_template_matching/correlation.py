@@ -7,13 +7,13 @@ def cross_correlate(
         projection_images: torch.Tensor,
 ):
     # at the moment, there is nothing about what to store
-    print("dfts of image")
+    #print("dfts of image")
     image_dft = torch.fft.rfftn(exp_images, dim=(-2, -1))
     
     #Should apply a filter here
     
     
-    print("dfts of reference")
+    #print("dfts of reference")
     reference_dft = torch.fft.rfftn(projection_images, dim=(-2, -1))   
     
     # collapse references to same dimension
@@ -23,9 +23,9 @@ def cross_correlate(
     reference_dft[:,0,0] = 0 + 0j
     
     
-    print("convolution")
+    #print("convolution")
     product = image_dft * reference_dft
-    print("Back to real")
+    #print("Back to real")
 
     result = torch.real(torch.fft.irfftn(product, dim=(-2, -1)))
     return result
@@ -35,15 +35,15 @@ def cross_correlate_single(
         projection_images: torch.Tensor,
 ):
     # at the moment, there is nothing about what to store
-    print("dfts of image")
+    #print("dfts of image")
     image_dft = torch.fft.rfftn(exp_images, dim=(-2, -1))
 
-    print("dfts of reference")
+    #print("dfts of reference")
     reference_dft = torch.fft.rfftn(projection_images, dim=(-2, -1))   
     
-    print("convolution")
+    #print("convolution")
     product = image_dft * reference_dft
-    print("Back to real")
+    #print("Back to real")
 
     result = torch.real(torch.fft.irfftn(product, dim=(-2, -1)))
     return result
