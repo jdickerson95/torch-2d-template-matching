@@ -89,6 +89,66 @@ def h3_to_rotation_matrix(h: str) -> torch.Tensor:
 def h3_to_xyz(h: str):
     return geo_to_xyz(torch.tensor(h3.h3_to_geo(h)))
 
+def get_uniform_euler_angles(in_plane_step: float = 1.5, out_of_plane_step: float = 2.5) -> torch.Tensor:
+    """Generate uniform euler angles (ZYZ convention) using Hopf fibration.
+
+    Uses right-handed, intrinsic (active) rotations in ZYZ convention:
+    1. First rotation by alpha around Z axis   [-180° to +180°]
+    2. Second rotation by beta around Y' axis  [0° to 180°]
+    3. Third rotation by gamma around Z'' axis [-180° to +180°]
+    
+    Note: The prime (') notation indicates the rotated coordinate system.
+    
+    Args:
+        in_plane_step: Angular step for in-plane rotation (alpha, gamma) in degrees
+        out_of_plane_step: Angular step for out-of-plane rotation (beta) in degrees
+    
+    Returns:
+        torch.Tensor of shape (N, 3) containing euler angles in degrees [alpha, beta, gamma]
+        where:
+            alpha ∈ [-180°, +180°]  - First rotation around Z
+            beta  ∈ [0°, 180°]      - Second rotation around Y'
+            gamma ∈ [-180°, +180°]  - Third rotation around Z''
+    """
+    # Convert steps to radians
+    in_plane_step = torch.deg2rad(torch.tensor(in_plane_step))
+    out_of_plane_step = torch.deg2rad(torch.tensor(out_of_plane_step))
+    
+    # Calculate number of samples for each angle
+    n_beta = int(torch.ceil(torch.tensor(180) / torch.rad2deg(out_of_plane_step)))
+    
+    # Generate beta values (out-of-plane angle)
+    beta = torch.linspace(0, torch.pi, n_beta)
+    
+    # Initialize list to store all angles
+    euler_angles = []
+    
+    # For each beta, calculate appropriate number of alpha and gamma samples
+    for b in beta:
+        # Number of samples for alpha at this beta
+        n_alpha = max(1, int(torch.ceil(2 * torch.pi * torch.sin(b) / in_plane_step)))
+        n_gamma = int(torch.ceil(2 * torch.pi / in_plane_step))
+        
+        # Generate alpha and gamma values
+        alpha = torch.linspace(-torch.pi, torch.pi, n_alpha)
+        gamma = torch.linspace(-torch.pi, torch.pi, n_gamma)
+        
+        # Create all combinations using einops
+        alpha = einops.repeat(alpha, 'a -> a g', g=n_gamma)
+        gamma = einops.repeat(gamma, 'g -> a g', a=n_alpha)
+        beta_expanded = torch.full_like(alpha, b)
+        
+        # Stack angles
+        angles = einops.rearrange([alpha, beta_expanded, gamma], 
+                                'xyz h w -> (h w) xyz')
+        euler_angles.append(angles)
+    
+    # Combine all angles and convert to degrees
+    euler_angles = torch.cat(euler_angles, dim=0)
+    euler_angles = torch.rad2deg(euler_angles)
+    
+    return euler_angles
+
 
 # import napari
 #
