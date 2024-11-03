@@ -9,26 +9,36 @@ import mrcfile
 from eulerangles import matrix2euler, euler2matrix
 
 from libtilt.interpolation import insert_into_image_2d
-from libtilt.filters.whitening import get_whitening_2d
 from scipy.spatial.transform import Rotation as R 
 
-import map_modification
-import so3_grid
-import projection
-import test_io
-import simulate
-import correlation
+from libtilt.interpolation import insert_into_image_2d
+import libtilt.image_handler.modify_image as mdfy
+import libtilt.filters.whitening as wht
+import libtilt.filters.bandpass as bp
+import libtilt.fft_utils as fftutil
+
+import torch_2d_template_matching.map_modification
+import torch_2d_template_matching.so3_grid
+import torch_2d_template_matching.projection
+import torch_2d_template_matching.test_io
+import torch_2d_template_matching.simulate
+import torch_2d_template_matching.correlation
 
 import sys
 
 
 
-def main():
-    pixel_size = 1.0
-    #Take input can easily make this multiple
-    simulated_image = sys.argv[1]
-    simulated_map = sys.argv[2]
-    
+def main(
+    simulated_image: str,
+    simulated_map: str,
+    pixel_size: float=1.0,
+    do_whiten: bool=True,
+    do_phase_randomize: bool=False,
+    bp_low: float=-1/99,
+    bp_high: float=1/2,
+    map_B: float=50
+):
+
     #Get the rotation matrix
     rotvecs = np.array([[0, 0, 0],[1, 1, 1]])
     rot_len = rotvecs.shape[0]
@@ -37,37 +47,59 @@ def main():
     print(euler_angles.shape)
     rotation_matrices = torch.from_numpy(euler2matrix(euler_angles, axes='zyz', intrinsic=True,right_handed_rotation=False)).float()
     
-    #Read in image and map
-    mrc_map = test_io.load_mrc(simulated_map)
-    mrc_image = test_io.load_mrc(simulated_image)
+    # load mrc micrograph
+    mrc_image = torch_2d_template_matching.test_io.load_mrc(simulated_image)
+    #keep only 1 image if multiple given
+    mrc_image = einops.reduce(mrc_image, '... h w -> h w', 'max')
     #crop edge 100 pixels
     mrc_image = mrc_image[100:-100,100:-100]
-    
-    #should apply whitening here
-    whitening_filter = get_whitening_2d(mrc_image)
-    image_dft = torch.fft.rfftn(mrc_image, dim=(-2, -1))
-    #image_dft *= whitening_filter
-    mrc_image = torch.real(torch.fft.irfftn(image_dft, dim=(-2, -1)))
-    #subtract means
-    mrc_image -= torch.mean(mrc_image) 
-    #normlize std 1
-    mrc_image /= torch.std(mrc_image)
+
+    #Make a pure noise image of same size
+    noise_image = torch.ones_like(mrc_image) * torch.mean(mrc_image)
+    poisson_noise = torch.poisson(noise_image)
+
+    #Get the whitening filter
+    whitening_filter = wht.get_whitening_2d(mrc_image)
+    if do_whiten:
+        #Apply this filter to the image
+        mrc_image = wht.whiten_image_2d(mrc_image, whitening_filter)
+        poisson_noise = wht.whiten_image_2d(poisson_noise, whitening_filter)
+    if bp_low > 0:
+        mrc_image = bp.bandpass_2d(mrc_image, bp_low,  bp_high, 0)
+        poisson_noise = bp.bandpass_2d(poisson_noise, bp_low,  bp_high, 0)
+    #modify the image to mean zero and std 1
+    mrc_image = mdfy.mean_zero(mrc_image)
+    mrc_image = mdfy.std_one(mrc_image)
+    poisson_noise = mdfy.mean_zero(poisson_noise)
+    poisson_noise = mdfy.std_one(poisson_noise)
+
+    #load the map
+    mrc_map = torch_2d_template_matching.test_io.load_mrc(simulated_map)
+    #keep only 1 map if multiple given
+    mrc_map = einops.reduce(mrc_map, '... z y x -> z y x', 'max')
+    #apply the B map
+    if map_B > 0:
+        mrc_map = torch_2d_template_matching.map_modification.apply_b_map(mrc_map, map_B, pixel_size)
+
     #save normal image
     with mrcfile.new('test_normal_sum.mrc', overwrite=True) as mrc:
         mrc.set_data(mrc_image.detach().numpy())    
+
+    
     
     image_size = mrc_image.shape
     volume_full_size = (min(image_size),image_size[0],image_size[1])
     #pad map to image size with edge mean
     # Average edge pixels (take this out to util)
-    mean_edge = projection.average_edge_pixels_3d(mrc_map)
+    mean_edge = torch_2d_template_matching.projection.average_edge_pixels_3d(mrc_map)
     #pad volume with this average
-    padded_volume = projection.pad_to_shape_3d(
+    padded_volume = torch_2d_template_matching.projection.pad_to_shape_3d(
             volume=mrc_map,
             volume_shape=mrc_map.shape,
             shape=volume_full_size,
             pad_val=mean_edge,
     )
+    
     #sets mean zero of this by zero central pixel
     #pad
     pad_length = padded_volume.shape[-1] //2
@@ -79,6 +111,7 @@ def main():
     padded_volume = torch.fft.ifftshift(padded_volume, dim=(-3, -2, -1))
     #padded_volume = torch.real(padded_volume[..., pad_length:-pad_length, pad_length:-pad_length, pad_length:-pad_length])
     
+
     
     #I think keeping the volume small and padding it a bit for ctf and then again for whitening
     # is the more efficient thing to do here
@@ -94,7 +127,7 @@ def main():
     defoc_len = defoci.shape[0]
     
     
-    projections = projection.project_reference(padded_volume, rotation_matrices, defoci, mrc_image.shape, pixel_size, whitening_filter)
+    projections = torch_2d_template_matching.projection.project_reference(padded_volume, rotation_matrices, defoci, mrc_image.shape, pixel_size, whitening_filter)
     
     
     
@@ -118,12 +151,15 @@ def main():
 
     
     #Cross correlate
-    xcorr = correlation.cross_correlate(mrc_image, projections)
+    xcorr = torch_2d_template_matching.correlation.cross_correlate(mrc_image, projections)
+    xcorr_poisson =  torch_2d_template_matching.correlation.cross_correlate(poisson_noise, projections)
     print(projections.shape)
     print(xcorr.shape)
-    std_xcorr = einops.reduce(xcorr, 'b h w -> b', reduction=projection.std_reduction)
-    std_xcorr = einops.rearrange(std_xcorr, 'b -> b 1 1')
-    SNR_all = xcorr / std_xcorr
+    #std_xcorr = einops.reduce(xcorr, 'b h w -> b', reduction=torch_2d_template_matching.projection.std_reduction)
+    #std_xcorr = einops.rearrange(std_xcorr, 'b -> b 1 1')
+    std_poisson = einops.reduce(xcorr_poisson, 'b h w -> b', reduction=torch_2d_template_matching.projection.std_reduction)
+    std_poisson = einops.rearrange(std_poisson, 'b -> b 1 1')
+    SNR_all = xcorr / std_poisson
     #Get the max pixels - I currently lose the orientation and defocus that produced each pixel
     max_index = torch.argmax(SNR_all, axis=0)
     rot_index = max_index % rot_len
@@ -157,10 +193,3 @@ def main():
 
     #do some thresholding
     
-
-
-
-
-
-if __name__ == "__main__":
-    main()

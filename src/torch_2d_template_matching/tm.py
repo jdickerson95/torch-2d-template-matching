@@ -8,30 +8,71 @@ import napari
 from eulerangles import matrix2euler
 
 from libtilt.interpolation import insert_into_image_2d
+import libtilt.image_handler.modify_image as mdfy
+import libtilt.filters.whitening as wht
+import libtilt.filters.bandpass as bp
+import libtilt.fft_utils as fftutil
 
-import map_modification
-import so3_grid
-import projection
-import test_io
-import simulate
-import correlation
+import torch_2d_template_matching.map_modification
+import torch_2d_template_matching.so3_grid
+import torch_2d_template_matching.projection
+import torch_2d_template_matching.test_io
+import torch_2d_template_matching.simulate
+import torch_2d_template_matching.correlation
 
 
-def main():
-    # get inputs, still need to do this
-    B = 50
-    # euler angle range so user can restrict range, agian will be a user input
+def main(
+    simulated_image: str,
+    simulated_map: str,
+    pixel_size: float=1.0,
+    do_whiten: bool=True,
+    do_phase_randomize: bool=False,
+    bp_low: float=-1/99,
+    bp_high: float=1/2,
+    map_B: float=50
+):
+    # euler angle range so user can restrict range, again will be a user input
     phi = (-180, 180)
-    theta = (-90, 90)
+    theta = (0, 180)
     psi = (-180, 180)
-    # load mrc
-    sim_image_shape = (2048, 2048)
-    pixel_size = 1.0
-    mrc_filepath = "/Users/josh/git/torch-2d-template-matching/data/7qn5.mrc"
-    mrc_map = test_io.load_mrc_map(mrc_filepath)
-    # apply any filters to the model
+    # load mrc micrograph
+    mrc_image = torch_2d_template_matching.test_io.load_mrc(simulated_image)
+    #keep only 1 image if multiple given
+    mrc_image = einops.reduce(mrc_image, '... h w -> h w', 'max')
+    #crop edge 100 pixels
+    mrc_image = mrc_image[100:-100,100:-100]
 
-    mrc_map = map_modification.apply_b_map(mrc_map, B, pixel_size)
+    #Make a pure noise image of same size
+    noise_image = torch.ones_like(mrc_image) * torch.mean(mrc_image)
+    poisson_noise = torch.poisson(noise_image)
+
+    #Get the whitening filter
+    whitening_filter = wht.get_whitening_2d(mrc_image)
+    if do_whiten:
+        #Apply this filter to the image
+        mrc_image = wht.whiten_image_2d(mrc_image, whitening_filter)
+        poisson_noise = wht.whiten_image_2d(poisson_noise, whitening_filter)
+    if bp_low > 0:
+        mrc_image = bp.bandpass_2d(mrc_image, bp_low,  bp_high, 0)
+        poisson_noise = bp.bandpass_2d(poisson_noise, bp_low,  bp_high, 0)
+    #modify the image to mean zero and std 1
+    mrc_image = mdfy.mean_zero(mrc_image)
+    mrc_image = mdfy.std_one(mrc_image)
+    poisson_noise = mdfy.mean_zero(poisson_noise)
+    poisson_noise = mdfy.std_one(poisson_noise)
+
+    #load the map
+    mrc_map = torch_2d_template_matching.test_io.load_mrc_map(simulated_map)
+    #keep only 1 map if multiple given
+    mrc_map = einops.reduce(mrc_map, '... z y x -> z y x', 'max')
+    #apply the B map
+    if map_B > 0:
+        mrc_map = torch_2d_template_matching.map_modification.apply_b_map(mrc_map, map_B, pixel_size)
+
+    #Next i will need to get the so3 grid
+
+
+
     # project model
     res = 0
     h3_grid = so3_grid.get_h3_grid_at_resolution(res)
@@ -66,25 +107,9 @@ def main():
     xcorr = correlation.cross_correlate(sim_images, projections)
     print('test')
     
-    viewer = napari.Viewer()
-    viewer.add_image(
-        sim_images.numpy(),
-        name='sim_images',
-        contrast_limits=(0, torch.max(sim_images))
-    )
-    viewer.add_image(
-        xcorr.numpy(),
-        name='template matching result',
-        contrast_limits=(0, torch.max(xcorr)),
-        colormap='inferno',
-        blending='additive',
-        opacity=0.3,
-    )
-    napari.run()
+    return 'test'
     
 
-if __name__ == "__main__":
-    main()
 
     '''
     INPUT_MODEL_FILE = 'data/4v6x-ribo.cif'
