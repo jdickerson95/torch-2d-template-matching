@@ -123,7 +123,7 @@ def main(
     
     #Extract Fourier slice
     #defoci = torch.tensor([-1.0, 1.0])
-    defoci = torch.arange(-1.6, 0.4, 0.2)
+    defoci = torch.arange(1.6, -0.4, -0.2)
     defoc_len = defoci.shape[0]
     
     

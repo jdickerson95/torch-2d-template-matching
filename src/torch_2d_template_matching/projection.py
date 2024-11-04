@@ -152,9 +152,11 @@ def project_reference(
             fftshift=fftshift,
     )
     # apply the ctf
-    dft_projections = torch.fft.rfftn(projection_images, dim=(-2, -1))
-    ctf = einops.rearrange(ctf, 'b h w -> b 1 h w')
-    ctf_dft_projection = dft_projections * ctf
+    dft_projections = torch.fft.rfftn(projection_images, dim=(-2, -1))  # [angles, H, W//2+1]
+    # Reshape for broadcasting
+    ctf = einops.rearrange(ctf, 'b h w -> b 1 h w')  # [defoci, 1, H, W//2+1]
+    dft_projections = einops.rearrange(dft_projections, 'a h w -> 1 a h w')  # [1, angles, H, W//2+1]
+    ctf_dft_projection = dft_projections * ctf  # [defoci, angles, H, W//2+1]
     
     
     #need to apply whitening filter, then zero central pixel
@@ -173,7 +175,7 @@ def project_reference(
     mean_proj = einops.rearrange(mean_proj, 'defoc angles -> defoc angles 1 1')
     defocused_projections = defocused_projections - mean_proj
     #flip contrast
-    defocused_projections *= -1
+    #defocused_projections *= -1
     #proj std 1
     std_proj = einops.reduce(defocused_projections, 'defoc angles h w -> defoc angles', reduction=std_reduction)
     std_proj = einops.rearrange(std_proj, 'defoc angles -> defoc angles 1 1')
