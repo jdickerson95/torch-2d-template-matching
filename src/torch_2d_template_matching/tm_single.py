@@ -38,9 +38,11 @@ def main(
     bp_high: float=1/2,
     map_B: float=50
 ):
-
+    
+    device = torch.device('cpu')  # Force CPU usage to avoid memory issues
+    torch.set_num_threads(4)  # Limit number of threads
     #Get the rotation matrix
-    rotvecs = np.array([[0, 0, 0],[1, 1, 1]])
+    rotvecs = np.array([[0, 0, 0],[1, 1, 1]], dtype=np.float32)
     rot_len = rotvecs.shape[0]
     r = R.from_rotvec(rotvecs)
     euler_angles = r.as_euler('zyz', degrees=True)
@@ -52,7 +54,8 @@ def main(
     #keep only 1 image if multiple given
     mrc_image = einops.reduce(mrc_image, '... h w -> h w', 'max')
     #crop edge 100 pixels
-    mrc_image = mrc_image[100:-100,100:-100]
+    edge_crop = 244
+    mrc_image = mrc_image[edge_crop:-edge_crop,edge_crop:-edge_crop]
 
     #Make a pure noise image of same size
     noise_image = torch.ones_like(mrc_image) * torch.mean(mrc_image)
@@ -110,7 +113,7 @@ def main(
     padded_volume = torch.fft.irfftn(dft_volume, dim=(-3, -2, -1))
     padded_volume = torch.fft.ifftshift(padded_volume, dim=(-3, -2, -1))
     #padded_volume = torch.real(padded_volume[..., pad_length:-pad_length, pad_length:-pad_length, pad_length:-pad_length])
-    
+    del dft_volume 
 
     
     #I think keeping the volume small and padding it a bit for ctf and then again for whitening
@@ -118,24 +121,21 @@ def main(
     
     
     #save normal volume
-    with mrcfile.new('test_normal_volume.mrc', overwrite=True) as mrc:
-        mrc.set_data(padded_volume.detach().numpy())    
+    #with mrcfile.new('test_normal_volume.mrc', overwrite=True) as mrc:
+    #    mrc.set_data(padded_volume.detach().numpy())    
     
     #Extract Fourier slice
     #defoci = torch.tensor([-1.0, 1.0])
-    defoci = torch.arange(1.6, -0.4, -0.2)
+    defoci = torch.arange(1.0, 0.8, -0.2)
     defoc_len = defoci.shape[0]
     
     
     projections = torch_2d_template_matching.projection.project_reference(padded_volume, rotation_matrices, defoci, mrc_image.shape, pixel_size, whitening_filter)
     
-    
+    del padded_volume
     
     #Can apply to the perfect optics from simulator and exit wavefunction and check it's the same
     
-    
-    
-
     
     #Apply CTF and any filters or envelope function (in projection now)
     #mean_proj = einops.reduce(projections, 'defoc angles h w -> defoc angles', 'mean')
@@ -154,6 +154,7 @@ def main(
     xcorr = torch_2d_template_matching.correlation.cross_correlate(mrc_image, projections)
     xcorr_poisson =  torch_2d_template_matching.correlation.cross_correlate(poisson_noise, projections)
     print(projections.shape)
+    del projections
     print(xcorr.shape)
     #std_xcorr = einops.reduce(xcorr, 'b h w -> b', reduction=torch_2d_template_matching.projection.std_reduction)
     #std_xcorr = einops.rearrange(std_xcorr, 'b -> b 1 1')

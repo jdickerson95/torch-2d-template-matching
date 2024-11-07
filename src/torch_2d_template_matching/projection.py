@@ -175,7 +175,7 @@ def project_reference(
     mean_proj = einops.rearrange(mean_proj, 'defoc angles -> defoc angles 1 1')
     defocused_projections = defocused_projections - mean_proj
     #flip contrast
-    #defocused_projections *= -1
+    defocused_projections *= -1
     #proj std 1
     std_proj = einops.reduce(defocused_projections, 'defoc angles h w -> defoc angles', reduction=std_reduction)
     std_proj = einops.rearrange(std_proj, 'defoc angles -> defoc angles 1 1')
