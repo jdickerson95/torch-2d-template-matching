@@ -112,7 +112,7 @@ def calculate_batch_size(
         neighborhood_size: int,
         device: torch.device,
         safety_factor: float = 0.8,  # Use only 80% of available memory by default
-        min_batch_size: int = 1
+        min_batch_size: int = 100
 ) -> int:
     """
     Calculate optimal batch size based on available GPU memory and data size.
@@ -127,7 +127,7 @@ def calculate_batch_size(
         Optimal batch size
     """
     if device.type == 'cpu':
-        return 1000  # Default CPU batch size
+        return min(1000, total_atoms)
         
     # Get available GPU memory in bytes
     gpu_memory = torch.cuda.get_device_properties(device).total_memory
@@ -685,7 +685,11 @@ def process_atoms_gpu2(
 
     # Calculate optimal batch size based on GPU memory
     total_voxels = voxel_offsets_flat.shape[0]
-    batch_size = min(1000, len(atom_indices))  # Adjust this based on available GPU memory
+    batch_size = calculate_batch_size(
+        total_atoms=len(atom_indices),
+        neighborhood_size=voxel_offsets_flat.shape[0] // 3,  # Size of one dimension of neighborhood
+        device=device
+    ) # Adjust this based on available GPU memory
     
     print(f"Processing with batch size: {batch_size}")
 
@@ -932,6 +936,12 @@ def simulate_3d_volume(
     num_devices = len(devices)
     atoms_per_device = len(atoms_zyx) // num_devices
     device_outputs = []
+
+    before_volume = time.time()
+    elapsed_time = before_volume - start_time
+    minutes = int(elapsed_time // 60)
+    seconds = int(elapsed_time % 60)
+    print(f"Before main simulation time: {minutes} minutes {seconds} seconds")
     # Handle CPU and GPU cases separately
     if devices[0].type == "cpu":
         b_params = torch.stack([torch.tensor(SCATTERING_PARAMETERS_B[atom_id]) 
@@ -993,6 +1003,13 @@ def simulate_3d_volume(
     # Move to CPU only for final save
     # apply a dose filter if specified 
     volume_grid_binned = volume_grid_binned.cpu()
+
+    before_dw = time.time()
+    elapsed_time = before_dw - start_time
+    minutes = int(elapsed_time // 60)
+    seconds = int(elapsed_time % 60)
+    print(f"Before dw simulation time: {minutes} minutes {seconds} seconds")
+
     if dose_weighting:
         volume_grid_binned = dose_weight_3d_volume(
             volume=volume_grid_binned,
@@ -1001,7 +1018,12 @@ def simulate_3d_volume(
             flux=flux,
             Bfac=dose_B
     )
-
+        
+    after_dw = time.time()
+    elapsed_time = after_dw - start_time
+    minutes = int(elapsed_time // 60)
+    seconds = int(elapsed_time % 60)
+    print(f"After dw simulation time: {minutes} minutes {seconds} seconds")
     # Apply a DQE if specified 
 
     mrcfile.write("simulated_volume_dw_us1.mrc", 
