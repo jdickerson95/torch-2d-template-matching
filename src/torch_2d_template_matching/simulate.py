@@ -41,9 +41,9 @@ def load_model(
         pixel_size: float,
 ) -> torch.Tensor:
     df = mmdf.read(file_path)
-    print(list(df.columns))
+    #print(list(df.columns))
     pd.set_option('display.max_columns', None)
-    print(df.head(10))
+    #print(df.head(10))
     atom_zyx = torch.tensor(df[['z', 'y', 'x']].to_numpy()).float()  # (n_atoms, 3)
     atom_zyx -= torch.mean(atom_zyx, dim=0, keepdim=True)  # center
     #atom_zyx /= pixel_size
@@ -51,11 +51,68 @@ def load_model(
     atom_b_factor = torch.tensor(df['b_isotropic'].to_numpy()).float()
     return atom_zyx, atom_id, atom_b_factor #atom_zyx is in units of angstroms
 
+def select_gpus(gpu_ids: list[int] = None, num_gpus: int = 1) -> list[torch.device]:
+    """
+    Select multiple GPU devices based on IDs or available memory.
+    
+    Args:
+        gpu_ids: List of specific GPU IDs to use. If None, selects GPUs with most available memory.
+        num_gpus: Number of GPUs to use if gpu_ids is None.
+    
+    Returns:
+        list[torch.device]: Selected GPU devices or [CPU] if no GPU available
+    """
+    if not torch.cuda.is_available():
+        print("No GPU available, using CPU")
+        return [torch.device("cpu")]
+        
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        print("No GPU available, using CPU")
+        return [torch.device("cpu")]
+    
+    # If specific GPUs requested, validate and return them
+    if gpu_ids is not None:
+        valid_devices = []
+        for gpu_id in gpu_ids:
+            if gpu_id >= n_gpus:
+                print(f"Requested GPU {gpu_id} not available. Max GPU ID is {n_gpus-1}")
+                continue
+            valid_devices.append(torch.device(f"cuda:{gpu_id}"))
+        
+        if not valid_devices:
+            print("No valid GPUs specified. Using CPU")
+            return [torch.device("cpu")]
+        return valid_devices
+    
+    # Find GPUs with most available memory
+    gpu_memory_available = []
+    print("\nAvailable GPUs:")
+    for i in range(n_gpus):
+        torch.cuda.set_device(i)
+        total_memory = torch.cuda.get_device_properties(i).total_memory
+        allocated_memory = torch.cuda.memory_allocated(i)
+        available = total_memory - allocated_memory
+        
+        print(f"GPU {i}: {torch.cuda.get_device_properties(i).name}")
+        print(f"  Total memory: {total_memory/1024**3:.1f} GB")
+        print(f"  Available memory: {available/1024**3:.1f} GB")
+        
+        gpu_memory_available.append((i, available))
+    
+    # Sort by available memory and select the top num_gpus
+    gpu_memory_available.sort(key=lambda x: x[1], reverse=True)
+    selected_gpus = [torch.device(f"cuda:{idx}") for idx, _ in gpu_memory_available[:num_gpus]]
+    
+    print("\nSelected GPUs:", [str(device) for device in selected_gpus])
+    return selected_gpus
+    
 def calculate_batch_size(
         total_atoms: int,
         neighborhood_size: int,
         device: torch.device,
-        safety_factor: float = 0.8  # Use only 80% of available memory by default
+        safety_factor: float = 0.8,  # Use only 80% of available memory by default
+        min_batch_size: int = 1
 ) -> int:
     """
     Calculate optimal batch size based on available GPU memory and data size.
@@ -74,7 +131,7 @@ def calculate_batch_size(
         
     # Get available GPU memory in bytes
     gpu_memory = torch.cuda.get_device_properties(device).total_memory
-    gpu_memory_available = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    #gpu_memory_available = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     
     # Calculate memory requirements per atom
     voxels_per_atom = (2 * neighborhood_size + 1) ** 3
@@ -90,16 +147,18 @@ def calculate_batch_size(
         voxels_per_atom * (3 * bytes_per_float)  # Voxel positions
         + voxels_per_atom * 1  # Valid mask (bool)
         + voxels_per_atom * (3 * bytes_per_float)  # Relative coordinates
-        + voxels_per_atom * bytes_per_float  # Potentials
+        + voxels_per_atom * bytes_per_float # Potentials
+        + 1024                              # Additional overhead
     )
     
     # Calculate batch size
-    optimal_batch_size = int((gpu_memory_available * safety_factor) / memory_per_atom)
+    optimal_batch_size = int((gpu_memory * safety_factor) / memory_per_atom)
     
     # Ensure batch size is at least 1 but not larger than total atoms
-    optimal_batch_size = max(1, min(optimal_batch_size, total_atoms))
+    optimal_batch_size = max(min_batch_size, min(optimal_batch_size, total_atoms))
     
-    print(f"Available GPU memory: {gpu_memory_available / 1024**3:.2f} GB")
+    print(f"Total GPU memory: {gpu_memory / 1024**3:.2f} GB")
+    #print(f"Available GPU memory: {gpu_memory_available / 1024**3:.2f} GB")
     print(f"Estimated memory per atom: {memory_per_atom / 1024**2:.2f} MB")
     print(f"Optimal batch size: {optimal_batch_size}")
     
@@ -225,16 +284,32 @@ def get_scattering_potential_of_voxel(
         bPlusB: torch.Tensor,
         atom_id: str,
         lead_term: float,
-        scattering_params_a: dict  # Add parameter dictionary
+        scattering_params_a: dict,  # Add parameter dictionary
+        device: torch.device = None
 ):
+    """
+    Calculate scattering potential for a voxel.
+    """
+    # If device not specified, use the device of input tensors
+    if device is None:
+        device = zyx_coords1.device
+
+    # Get scattering parameters for this atom type and move to correct device
+    # Convert parameters to tensor and move to device
+    if isinstance(scattering_params_a[atom_id], torch.Tensor):
+        a_params = scattering_params_a[atom_id].clone().detach().to(device)
+    else:
+        a_params = torch.as_tensor(scattering_params_a[atom_id], device=device)
+    
     # Compare signs element-wise for batched coordinates
     t1 = (zyx_coords1[:, 2] * zyx_coords2[:, 2]) >= 0  # Shape: (N,)
     t2 = (zyx_coords1[:, 1] * zyx_coords2[:, 1]) >= 0  # Shape: (N,)
     t3 = (zyx_coords1[:, 0] * zyx_coords2[:, 0]) >= 0  # Shape: (N,)
 
-    temp_potential = torch.zeros(len(zyx_coords1))
+    temp_potential = torch.zeros(len(zyx_coords1), device=device)
 
     for i, bb in enumerate(bPlusB):
+        a = a_params[i]
         # Handle z dimension
         x_term = torch.where(
             t1,
@@ -257,7 +332,58 @@ def get_scattering_potential_of_voxel(
         )
 
         t0 = z_term * y_term * x_term
-        temp_potential += scattering_params_a[atom_id][i] * torch.abs(t0)
+        temp_potential += a * torch.abs(t0)
+
+    return lead_term * temp_potential
+
+def get_scattering_potential_of_voxel_batched(
+        zyx_coords1: torch.Tensor,  # Shape: [N, 3]
+        zyx_coords2: torch.Tensor,  # Shape: [N, 3]
+        bPlusB: torch.Tensor,      # Shape: [1, 5]
+        atom_id: str,
+        lead_term: float,
+        scattering_params_a: dict,
+        device: torch.device
+):
+    """
+    Vectorized version of scattering potential calculation
+    """
+    # Get scattering parameters
+    a_params = scattering_params_a[atom_id]
+    
+    # Calculate signs for all coordinates at once
+    t1 = (zyx_coords1[:, 2] * zyx_coords2[:, 2]) >= 0
+    t2 = (zyx_coords1[:, 1] * zyx_coords2[:, 1]) >= 0
+    t3 = (zyx_coords1[:, 0] * zyx_coords2[:, 0]) >= 0
+
+    # Initialize potentials
+    temp_potential = torch.zeros(len(zyx_coords1), device=device)
+    
+    # Calculate all error functions at once
+    for i, a in enumerate(a_params):
+        bb = bPlusB[0, i]  # Single value for this parameter
+        
+        # Calculate terms
+        x_term = torch.where(
+            t1,
+            torch.special.erf(bb * zyx_coords2[:, 2]) - torch.special.erf(bb * zyx_coords1[:, 2]),
+            torch.abs(torch.special.erf(bb * zyx_coords2[:, 2])) + torch.abs(torch.special.erf(bb * zyx_coords1[:, 2]))
+        )
+        
+        y_term = torch.where(
+            t2,
+            torch.special.erf(bb * zyx_coords2[:, 1]) - torch.special.erf(bb * zyx_coords1[:, 1]),
+            torch.abs(torch.special.erf(bb * zyx_coords2[:, 1])) + torch.abs(torch.special.erf(bb * zyx_coords1[:, 1]))
+        )
+        
+        z_term = torch.where(
+            t3,
+            torch.special.erf(bb * zyx_coords2[:, 0]) - torch.special.erf(bb * zyx_coords1[:, 0]),
+            torch.abs(torch.special.erf(bb * zyx_coords2[:, 0])) + torch.abs(torch.special.erf(bb * zyx_coords1[:, 0]))
+        )
+
+        t0 = z_term * y_term * x_term
+        temp_potential = temp_potential + (a * torch.abs(t0))
 
     return lead_term * temp_potential
 
@@ -406,7 +532,7 @@ def process_atoms_parallel(atom_indices, bPlusB, atoms_id_filtered, voxel_offset
         atoms_id_filtered = atoms_id_filtered.tolist()
     
     num_atoms = len(atom_indices)
-    batch_size = max(1, num_atoms // (n_cores * 4))  # Divide work into smaller batches
+    batch_size = max(1, num_atoms // (n_cores))  # Divide work into smaller batches
     
     print(f"Processing {num_atoms} atoms in batches of {batch_size}")
     
@@ -451,68 +577,82 @@ def process_atoms_gpu(
         lead_term: float,
         device: torch.device
 ):
-    # Initialize volume grid on GPU
-    volume_grid = torch.zeros(upsampled_shape, device=device)
     
-    # Process in batches to avoid GPU memory issues
-    # Calculate optimal batch size
+    # Pre-compute scattering parameters for all atom types in batch
+    unique_atom_types = list(set(atoms_id_filtered))
+    scattering_params = {atom_type: torch.tensor(SCATTERING_PARAMETERS_A[atom_type], device=device) 
+                        for atom_type in unique_atom_types}
+    
+    # Clear CUDA cache before calculating batch size
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    
     batch_size = calculate_batch_size(
         total_atoms=len(atom_indices),
         neighborhood_size=voxel_offsets_flat.shape[0] // 3,  # Size of one dimension of neighborhood
         device=device
     )
+    # Initialize volume grid on GPU
+    volume_grid = torch.zeros(upsampled_shape, device=device)
+
+
+
     try:
         for start_idx in range(0, len(atom_indices), batch_size):
             end_idx = min(start_idx + batch_size, len(atom_indices))
             
-            try:
-                # Get batch data
-                atom_pos_batch = atom_indices[start_idx:end_idx]
-                atom_id_batch = atoms_id_filtered[start_idx:end_idx]
-                bPlusB_batch = bPlusB[start_idx:end_idx]
-                
-                # Calculate voxel positions for all atoms in batch
-                voxel_positions = atom_pos_batch.unsqueeze(1) + voxel_offsets_flat
+            # Get batch data
+            atom_pos_batch = atom_indices[start_idx:end_idx]
+            atom_id_batch = atoms_id_filtered[start_idx:end_idx]
+            bPlusB_batch = bPlusB[start_idx:end_idx]
             
-                # Check bounds for each dimension
-                valid_z = (voxel_positions[..., 0] >= 0) & (voxel_positions[..., 0] < upsampled_shape[0])
-                valid_y = (voxel_positions[..., 1] >= 0) & (voxel_positions[..., 1] < upsampled_shape[1])
-                valid_x = (voxel_positions[..., 2] >= 0) & (voxel_positions[..., 2] < upsampled_shape[2])
-                valid_mask = valid_z & valid_y & valid_x
+            # Calculate voxel positions for all atoms in batch
+            voxel_positions = atom_pos_batch.unsqueeze(1) + voxel_offsets_flat.to(device)
             
-                for i, (atom_pos, atom_id, valid) in enumerate(zip(atom_pos_batch, atom_id_batch, valid_mask)):
-                    if valid.any():
-                        # Calculate coordinates relative to atom center
-                        relative_coords = ((voxel_positions[i][valid] - atom_pos) * upsampled_pixel_size)
-                        coords1 = relative_coords - (upsampled_pixel_size/2)
-                        coords2 = relative_coords + (upsampled_pixel_size/2)
-                        
-                        # Calculate potentials
-                        potentials = get_scattering_potential_of_voxel(
+            # Check bounds for each dimension
+            valid_z = (voxel_positions[..., 0] >= 0) & (voxel_positions[..., 0] < upsampled_shape[0])
+            valid_y = (voxel_positions[..., 1] >= 0) & (voxel_positions[..., 1] < upsampled_shape[1])
+            valid_x = (voxel_positions[..., 2] >= 0) & (voxel_positions[..., 2] < upsampled_shape[2])
+            valid_mask = valid_z & valid_y & valid_x
+
+            # Process all valid positions for the batch at once
+            valid_positions_all = []
+            potentials_all = []
+            
+            for i, (atom_pos, atom_id, valid) in enumerate(zip(atom_pos_batch, atom_id_batch, valid_mask)):
+                if valid.any():
+                    # Calculate coordinates relative to atom center
+                    relative_coords = ((voxel_positions[i][valid] - atom_pos) * upsampled_pixel_size)
+                    coords1 = relative_coords - (upsampled_pixel_size/2)
+                    coords2 = relative_coords + (upsampled_pixel_size/2)
+                    
+                    # Calculate potentials
+                    potentials = get_scattering_potential_of_voxel(
                             coords1,
                             coords2,
                             bPlusB_batch[i],
                             atom_id,
                             lead_term,
-                            SCATTERING_PARAMETERS_A
-                        )
+                            scattering_params,  # Pass pre-computed params
+                            device=device
+                    )
                 
-                     # Update volume grid
-                        valid_positions = voxel_positions[i][valid].long()
-                        volume_grid[valid_positions[:, 0], 
-                              valid_positions[:, 1], 
-                              valid_positions[:, 2]] += potentials
-            
-                # Clear CUDA cache periodically
-                if device.type == 'cuda' and (start_idx + batch_size) % (batch_size * 10) == 0:
-                    torch.cuda.empty_cache()
+                    # Update volume grid
+                    valid_positions = voxel_positions[i][valid].long()
+                    valid_positions_all.append(valid_positions)
+                    potentials_all.append(potentials)
 
-            except torch.cuda.OutOfMemoryError:
-                # If we run out of memory, reduce batch size and retry
-                print(f"Out of memory with batch size {batch_size}, reducing by half...")
-                batch_size = max(1, batch_size // 2)
-                torch.cuda.empty_cache()
-                continue
+            
+            # Batch update volume grid
+            if valid_positions_all:
+                valid_positions_cat = torch.cat(valid_positions_all, dim=0)
+                potentials_cat = torch.cat(potentials_all, dim=0)
+                volume_grid.index_put_((valid_positions_cat[:, 0], 
+                                      valid_positions_cat[:, 1], 
+                                      valid_positions_cat[:, 2]),
+                                     potentials_cat,
+                                     accumulate=True)
+
         
             # progress update
             if (start_idx + batch_size) % (batch_size * 5) == 0:
@@ -523,25 +663,218 @@ def process_atoms_gpu(
     
     return volume_grid
 
+def process_atoms_gpu2(
+        atom_indices: torch.Tensor,
+        bPlusB: torch.Tensor,
+        atoms_id_filtered: list,
+        voxel_offsets_flat: torch.Tensor,
+        upsampled_shape: tuple,
+        upsampled_pixel_size: float,
+        lead_term: float,
+        device: torch.device
+):
+    # Pre-compute scattering parameters
+    unique_atom_types = list(set(atoms_id_filtered))
+    scattering_params = {
+        atom_type: torch.as_tensor(SCATTERING_PARAMETERS_A[atom_type], device=device)
+        for atom_type in unique_atom_types
+    }
+
+    # Initialize volume grid
+    volume_grid = torch.zeros(upsampled_shape, device=device)
+
+    # Calculate optimal batch size based on GPU memory
+    total_voxels = voxel_offsets_flat.shape[0]
+    batch_size = min(1000, len(atom_indices))  # Adjust this based on available GPU memory
+    
+    print(f"Processing with batch size: {batch_size}")
+
+    for start_idx in range(0, len(atom_indices), batch_size):
+        end_idx = min(start_idx + batch_size, len(atom_indices))
+        current_batch_size = end_idx - start_idx
+        
+        # Get batch data
+        batch_indices = atom_indices[start_idx:end_idx].to(device)
+        batch_bPlusB = bPlusB[start_idx:end_idx].to(device)
+        batch_atoms_id = atoms_id_filtered[start_idx:end_idx]
+
+        # Process each atom type in parallel
+        for atom_type in unique_atom_types:
+            # Get indices for this atom type in the batch
+            type_mask = torch.tensor([aid == atom_type for aid in batch_atoms_id], device=device)
+            if not type_mask.any():
+                continue
+
+            type_indices = torch.where(type_mask)[0]
+            n_atoms_of_type = len(type_indices)
+            
+            if n_atoms_of_type == 0:
+                continue
+
+            # Calculate positions for all atoms of this type at once
+            atom_positions = batch_indices[type_indices]  # Shape: [n_atoms, 3]
+            
+            # Reshape for broadcasting
+            atom_positions = atom_positions.view(n_atoms_of_type, 1, 3)  # Shape: [n_atoms, 1, 3]
+            offsets = voxel_offsets_flat.to(device).view(1, -1, 3)  # Shape: [1, n_voxels, 3]
+            
+            # Calculate all voxel positions at once
+            voxel_positions = atom_positions + offsets  # Shape: [n_atoms, n_voxels, 3]
+            
+            # Check bounds
+            valid_z = (voxel_positions[..., 0] >= 0) & (voxel_positions[..., 0] < upsampled_shape[0])
+            valid_y = (voxel_positions[..., 1] >= 0) & (voxel_positions[..., 1] < upsampled_shape[1])
+            valid_x = (voxel_positions[..., 2] >= 0) & (voxel_positions[..., 2] < upsampled_shape[2])
+            valid_mask = valid_z & valid_y & valid_x  # Shape: [n_atoms, n_voxels]
+
+            # Calculate relative coordinates for all valid positions
+            relative_coords = voxel_positions - atom_positions
+            relative_coords = relative_coords * upsampled_pixel_size
+            
+            # Prepare coordinates for potential calculation
+            valid_coords = relative_coords[valid_mask]
+            coords1 = valid_coords - (upsampled_pixel_size/2)
+            coords2 = valid_coords + (upsampled_pixel_size/2)
+            
+            # Get bPlusB for valid atoms
+            valid_bPlusB = batch_bPlusB[type_indices][valid_mask.any(dim=1)]
+            
+            if len(valid_bPlusB) > 0:
+                # Calculate potentials for all valid positions
+                potentials = get_scattering_potential_of_voxel_batched(
+                    coords1,
+                    coords2,
+                    valid_bPlusB,
+                    atom_type,
+                    lead_term,
+                    scattering_params,
+                    device
+                )
+
+                # Get valid positions for updating volume grid
+                valid_positions = voxel_positions[valid_mask].long()
+                
+                # Update volume grid
+                volume_grid.index_put_(
+                    (valid_positions[:, 0], valid_positions[:, 1], valid_positions[:, 2]),
+                    potentials,
+                    accumulate=True
+                )
+
+        if (start_idx + batch_size) % (batch_size * 5) == 0:
+            print(f"Processed {start_idx + batch_size} atoms of {len(atom_indices)}")
+
+    return volume_grid
+
+def process_atoms_serial(
+        atom_indices: torch.Tensor,
+        bPlusB: torch.Tensor,
+        atoms_id_filtered: list,
+        voxel_offsets_flat: torch.Tensor,
+        upsampled_shape: tuple,
+        upsampled_pixel_size: float,
+        lead_term: float
+):
+    """
+    Process atoms serially (for CPU processing within a worker process)
+    """
+    # Initialize local volume grid
+    local_volume = torch.zeros(upsampled_shape, device='cpu')
+    
+    # Process each atom
+    for i in range(len(atom_indices)):
+        atom_pos = atom_indices[i]
+        atom_id = atoms_id_filtered[i]
+        
+        # Calculate voxel positions relative to atom center
+        voxel_positions = atom_pos.view(1, 3) + voxel_offsets_flat
+        
+        # Check bounds for each dimension separately
+        valid_z = (voxel_positions[:, 0] >= 0) & (voxel_positions[:, 0] < upsampled_shape[0])
+        valid_y = (voxel_positions[:, 1] >= 0) & (voxel_positions[:, 1] < upsampled_shape[1])
+        valid_x = (voxel_positions[:, 2] >= 0) & (voxel_positions[:, 2] < upsampled_shape[2])
+        valid_mask = valid_z & valid_y & valid_x
+        
+        if valid_mask.any():
+            relative_coords = ((voxel_positions[valid_mask] - atom_pos) * upsampled_pixel_size)
+            coords1 = relative_coords - (upsampled_pixel_size/2)
+            coords2 = relative_coords + (upsampled_pixel_size/2)
+            
+            potentials = get_scattering_potential_of_voxel(
+                coords1,
+                coords2,
+                bPlusB[i],
+                atom_id,
+                lead_term,
+                SCATTERING_PARAMETERS_A
+            )
+            
+            valid_positions = voxel_positions[valid_mask].long()
+            local_volume[valid_positions[:, 0], 
+                        valid_positions[:, 1], 
+                        valid_positions[:, 2]] += potentials
+        
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i + 1} atoms")
+            
+    return local_volume
+
+def process_device_atoms(args):
+    """
+    Process atoms for a single device in parallel.
+    """
+    (device_atom_indices, device_bPlusB, device_atoms_id, voxel_offsets_flat,
+     upsampled_shape, upsampled_pixel_size, lead_term, device, n_cpu_cores) = args
+    
+    print(f"\nProcessing atoms on {device}")
+    
+    if device.type == "cuda":
+        volume_grid = process_atoms_gpu2(
+            atom_indices=device_atom_indices.to(device),
+            bPlusB=device_bPlusB.to(device),
+            atoms_id_filtered=device_atoms_id,
+            voxel_offsets_flat=voxel_offsets_flat.to(device),
+            upsampled_shape=upsampled_shape,
+            upsampled_pixel_size=upsampled_pixel_size,
+            lead_term=lead_term,
+            device=device
+        )
+    else:
+        volume_grid = process_atoms_parallel(
+            atom_indices=device_atom_indices,
+            bPlusB=device_bPlusB,
+            atoms_id_filtered=device_atoms_id,
+            voxel_offsets_flat=voxel_offsets_flat,
+            upsampled_shape=upsampled_shape,
+            upsampled_pixel_size=upsampled_pixel_size,
+            lead_term=lead_term,
+            n_cores=n_cpu_cores
+        )
+    
+    return volume_grid
+
 
 def simulate_3d_volume(
         pdb_filename: str,
         sim_volume_shape: tuple[int, int, int],
         sim_pixel_spacing: float,
         n_cpu_cores: int,
-        use_gpu: bool = False 
+        gpu_ids: list[int] = None, # [-999] is cpu, None is auto most available memory, [0, 1, 2], etc is specific gpu
+        num_gpus: int = 1
 ):
     start_time = time.time()
 
-    # Determine device
-    device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # Select devices
+    if gpu_ids == [-999]:  # Special case for CPU-only
+        devices = [torch.device("cpu")]
+    else:
+        devices = select_gpus(gpu_ids, num_gpus)
+    
+    print(f"Using devices: {[str(device) for device in devices]}")
 
     atoms_zyx, atoms_id, atoms_b_factor = load_model(pdb_filename, sim_pixel_spacing)
-      # Move tensors to appropriate device
-    atoms_zyx = atoms_zyx.to(device)
-    atoms_b_factor = atoms_b_factor.to(device)  
 
+    # constants and stuff
     b_scaling = 1
     added_B = 10.0
     atoms_b_factor_scaled = 0.25 * (atoms_b_factor * b_scaling + added_B) # I'm not sure what the 0.25 is
@@ -562,7 +895,6 @@ def simulate_3d_volume(
     upsampling = 1
     upsampled_pixel_size = sim_pixel_spacing / upsampling
     upsampled_shape = tuple(np.array(sim_volume_shape) * upsampling)
-    volume_grid = torch.zeros(upsampled_shape, device=device)
 
     #I'm making sure the index is on the edge of a voxel
     origin_idx = (int(upsampled_shape[0] // 2), int(upsampled_shape[1] // 2), int(upsampled_shape[2] // 2))
@@ -570,23 +902,15 @@ def simulate_3d_volume(
     lead_term = BOND_SCALING_FACTOR * wavelength_A / 8.0 / upsampled_pixel_size / upsampled_pixel_size
     #Not sure where the 8 comes from here
 
-    # CisTEM does it like this though... I will use this for now
+        # CisTEM does it like this though... I will use this for now
     size_neighborhood = get_size_neighborhood_cistem(mean_b_factor, upsampled_pixel_size)
-    neighborhood_range = torch.arange(-size_neighborhood, size_neighborhood+1, device=device) #pixels to do either side
-    # print(f"size_neighborhood: {size_neighborhood}")
-
-    # I will also try supersampling with the more traditional approach and compare... 
+    neighborhood_range = torch.arange(-size_neighborhood, size_neighborhood+1) 
 
     # Filter out hydrogen atoms
     non_h_mask = [id != "H" for id in atoms_id]
     atoms_zyx_filtered = atoms_zyx[non_h_mask]
     atoms_id_filtered = [id for i, id in enumerate(atoms_id) if non_h_mask[i]]
     atoms_b_factor_scaled_filtered = atoms_b_factor_scaled[non_h_mask]
-
-    # Calculate B-factors for all atoms at once
-    b_params = torch.stack([torch.tensor(SCATTERING_PARAMETERS_B[atom_id], device=device) 
-                           for atom_id in atoms_id_filtered]) # Shape: (n_atoms, 5)
-    bPlusB = 2 * torch.pi / torch.sqrt(atoms_b_factor_scaled_filtered.unsqueeze(1) + b_params)  # Shape: (n_atoms, 5)
 
     # Calculate atom indices in volume
     # Convert from centered Angstroms to voxel coordinates
@@ -604,9 +928,17 @@ def simulate_3d_volume(
     # Flatten while preserving the relative positions
     voxel_offsets_flat = voxel_offsets.reshape(3, -1).T  # (n^3, 3)
 
-    if use_gpu and torch.cuda.is_available():
-        # Use GPU processing
-        volume_grid = process_atoms_gpu(
+    # Split atoms across available devices
+    num_devices = len(devices)
+    atoms_per_device = len(atoms_zyx) // num_devices
+    device_outputs = []
+    # Handle CPU and GPU cases separately
+    if devices[0].type == "cpu":
+        b_params = torch.stack([torch.tensor(SCATTERING_PARAMETERS_B[atom_id]) 
+                              for atom_id in atoms_id_filtered])
+        bPlusB = 2 * torch.pi / torch.sqrt(atoms_b_factor_scaled_filtered.unsqueeze(1) + b_params)
+        # If CPU only, use the original parallel processing directly
+        volume_grid = process_atoms_parallel(
             atom_indices=atom_indices,
             bPlusB=bPlusB,
             atoms_id_filtered=atoms_id_filtered,
@@ -614,34 +946,52 @@ def simulate_3d_volume(
             upsampled_shape=upsampled_shape,
             upsampled_pixel_size=upsampled_pixel_size,
             lead_term=lead_term,
-            device=device
-        )
-    else:
-        # Use CPU processing
-        volume_grid = process_atoms_parallel(
-            atom_indices=atom_indices.cpu(),
-            bPlusB=bPlusB.cpu(),
-            atoms_id_filtered=atoms_id_filtered,
-            voxel_offsets_flat=voxel_offsets_flat.cpu(),
-            upsampled_shape=upsampled_shape,
-            upsampled_pixel_size=upsampled_pixel_size,
-            lead_term=lead_term,
             n_cores=n_cpu_cores
         )
-        volume_grid = volume_grid.to(device)
+        device_outputs = [volume_grid]
+    else:
+        device_args = []
+        for i, device in enumerate(devices):
+            # Calculate start and end indices for this device
+            start_idx = i * atoms_per_device
+            end_idx = start_idx + atoms_per_device if i < num_devices - 1 else len(atom_indices)
+            
+            # Get device-specific data
+            device_atom_indices = atom_indices[start_idx:end_idx]
+            device_atoms_id = atoms_id_filtered[start_idx:end_idx]
+            device_b_factor = atoms_b_factor_scaled_filtered[start_idx:end_idx]
+            
+            # Calculate B-factors for this device's atoms
+            b_params = torch.stack([torch.tensor(SCATTERING_PARAMETERS_B[atom_id]) 
+                              for atom_id in device_atoms_id])
+            device_bPlusB = 2 * torch.pi / torch.sqrt(device_b_factor.unsqueeze(1) + b_params)
+
+            args = (device_atom_indices, device_bPlusB, device_atoms_id, voxel_offsets_flat,
+               upsampled_shape, upsampled_pixel_size, lead_term, device, n_cpu_cores)
+            device_args.append(args)
+        
+        # Process on all devices in parallel
+        with mp.get_context('spawn').Pool(processes=len(devices)) as pool:
+            device_outputs = pool.map(process_device_atoms, device_args)
+
+    # Combine results from all devices
+    main_device = devices[0]
+    final_volume = torch.zeros(upsampled_shape, device=main_device)
+    for volume in device_outputs:
+        final_volume += volume.to(main_device) 
 
     #Undo the upsanmpling here
     # Bin the volume back to original size using 3D average pooling
     volume_grid_binned = torch.nn.functional.avg_pool3d(
-        volume_grid.unsqueeze(0),  # Add batch dimension
+        final_volume.unsqueeze(0),  # Add batch dimension
         kernel_size=upsampling,
         stride=upsampling
     ).squeeze(0)  # Remove batch dimension
 
     # I would then do any moodifications to volume grid here
-    # apply a dose filter if specified 
 
-    # Move to CPU for saving and dose weighting
+    # Move to CPU only for final save
+    # apply a dose filter if specified 
     volume_grid_binned = volume_grid_binned.cpu()
     if dose_weighting:
         volume_grid_binned = dose_weight_3d_volume(
@@ -654,7 +1004,7 @@ def simulate_3d_volume(
 
     # Apply a DQE if specified 
 
-    mrcfile.write("/Users/josh/git/2dtm_tests/simulator/simulated_volume_dw_us1.mrc", 
+    mrcfile.write("simulated_volume_dw_us1.mrc", 
                   volume_grid_binned.numpy(), overwrite=True)
 
     end_time = time.time()
