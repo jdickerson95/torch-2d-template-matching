@@ -5,11 +5,16 @@ import time
 import einops
 import numpy as np
 import torch
+import math
 import mmdf
 from libtilt.interpolation import insert_into_image_2d
 from libtilt.ctf.ctf_2d import calculate_ctf
 from libtilt.ctf.relativistic_wavelength import calculate_relativistic_electron_wavelength
 from libtilt.image_handler.doseweight_movie import dose_weight_3d_volume
+from libtilt.image_handler.doseweight_movie import cumulative_dose_filter_3d
+from libtilt.grids import fftfreq_grid
+#from torch_fourier_rescale.fourier_rescale_3d import fourier_rescale_3d
+#from torch_fourier_rescale.fourier_rescale_3d import fourier_rescale_3d_force_size
 
 from torch_2d_template_matching.so3_grid import get_h3_grid_at_resolution
 from torch_2d_template_matching.so3_grid import h3_to_rotation_matrix
@@ -35,6 +40,91 @@ SCATTERING_PARAMETERS_B = {k: v for k, v in data["parameters_b"].items() if v !=
 
 BOND_SCALING_FACTOR = 1.043
 
+# Assuming a perfect counting - so no read noise, and no coincednce loss. Then we have a flat NPS and the DQE is just DQE(0)*MTF^2
+# The parameters below are for a 5 gaussian fit to 300 KeV , 2.5 EPS from Ruskin et al. with DQE(0) = 0.791
+
+DQE_PARAMETERS_A = [-0.01516, -0.5662, -0.09731, -0.01551, 21.47]
+
+DQE_PARAMETERS_B = [0.02671, -0.02504, 0.162, 0.2831, -2.28]
+
+DQE_PARAMETERS_C = [0.01774, 0.1441, 0.1082, 0.07916, 1.372]
+
+cisTEM_offset = 0.5
+
+def fourier_rescale_3d_force_size(
+    volume: torch.Tensor,
+    target_size: float,
+) -> torch.Tensor:
+    """
+    Crop a 3D Fourier-transformed volume to an even target size while maintaining symmetry using rfft.
+    
+    Parameters:
+    - volume (torch.Tensor): The input volume in real space of shape (D, H, W).
+    - target_size (int): The desired even size to crop in Fourier space for each dimension.
+    
+    Returns:
+    - cropped_volume (torch.Tensor): The cropped volume back in real space with dimensions (target_size, target_size, target_size).
+    """
+    # Ensure the target size is even
+    assert target_size % 2 == 0, "Target size must be even."
+    
+    # Get the original size of the volume
+    original_size = volume.shape[0]  # Assumes volume is cubic for simplicity
+    assert volume.shape[0] == volume.shape[1] == volume.shape[2], "Volume must be cubic."
+    
+    # Step 1: Perform real-to-complex Fourier Transform (rfftn) and shift the zero frequency to the center
+    volume = torch.fft.fftshift(volume, dim=(-3, -2, -1))
+    volume_fft = torch.fft.rfftn(volume, dim=(-3, -2, -1))
+    volume_fft_shifted = torch.fft.fftshift(volume_fft, dim=(-3, -2, -1))  # Shift along first two dimensions only
+
+    # Calculate the dimensions of the rfftn output
+    rfft_size_z, rfft_size_y, rfft_size_x = volume_fft_shifted.shape
+
+    # Calculate cropping indices for each dimension
+    center_z = rfft_size_z // 2
+    center_y = rfft_size_y // 2
+
+    # Define the cropping ranges
+    crop_start_z = center_z - target_size // 2
+    crop_end_z = center_z + target_size // 2
+    crop_start_y = center_y - target_size // 2
+    crop_end_y = center_y + target_size // 2
+    crop_start_x = 0  # Start from the beginning in the last dimension (low frequencies)
+    crop_end_x = target_size // 2 + 1  # Crop from the high-frequency end only along the last dimension
+
+    # Step 2: Crop the Fourier-transformed volume
+    cropped_fft = volume_fft_shifted[crop_start_z:crop_end_z, crop_start_y:crop_end_y, -crop_end_x:]
+    
+    
+    # Step 3: Inverse shift and apply the inverse rFFT to return to real space
+    cropped_fft_shifted_back = torch.fft.ifftshift(cropped_fft, dim=(-3, -2))
+    cropped_volume = torch.fft.irfftn(cropped_fft_shifted_back, s=(target_size, target_size, target_size), dim=(-3, -2, -1))
+    cropped_volume = torch.fft.ifftshift(cropped_volume, dim=(-3, -2, -1))
+
+    return cropped_volume
+
+#Apply DQE function, this should really go in libtilt filters
+#Can specify if this is a FFT or image being passed in
+def apply_dqe_volume(volume, dqe_parameters_a, dqe_parameters_b, dqe_parameters_c, pixel_size: float):
+    
+    dft_volume = torch.fft.rfftn(volume, dim=(-3, -2, -1))
+    fft_freq_px = (
+        fftfreq_grid(
+            image_shape=volume.shape,
+            rfft=True,
+            fftshift=False,
+            norm=True,
+        )
+        / pixel_size
+    )
+
+    weight = 0
+    for i in range(5):
+        weight += (dqe_parameters_a[i] * torch.exp(-1.0 * torch.pow((fft_freq_px - dqe_parameters_b[i])/dqe_parameters_c[i], 2)))
+
+    dft_volume *= weight
+    volume = torch.fft.irfftn(dft_volume, dim=(-3, -2, -1))
+    return volume
 
 def load_model(
         file_path: str,
@@ -310,7 +400,7 @@ def get_scattering_potential_of_voxel(
 
     for i, bb in enumerate(bPlusB):
         a = a_params[i]
-        # Handle z dimension
+        # Handle x dimension
         x_term = torch.where(
             t1,
             torch.special.erf(bb * zyx_coords2[:, 2]) - torch.special.erf(bb * zyx_coords1[:, 2]),
@@ -324,7 +414,7 @@ def get_scattering_potential_of_voxel(
             torch.abs(torch.special.erf(bb * zyx_coords2[:, 1])) + torch.abs(torch.special.erf(bb * zyx_coords1[:, 1]))
         )
         
-        # Handle x dimension
+        # Handle z dimension
         z_term = torch.where(
             t3,
             torch.special.erf(bb * zyx_coords2[:, 0]) - torch.special.erf(bb * zyx_coords1[:, 0]),
@@ -464,12 +554,13 @@ def get_size_neighborhood_cistem(mean_b_factor, upsampled_pixel_size):
 def process_atom_batch(batch_args):
     try:
         # Unpack the tuple correctly
-        (atom_indices_batch, bPlusB_batch, atoms_id_filtered_batch, 
+        (atom_indices_batch, atom_dds_batch, bPlusB_batch, atoms_id_filtered_batch, 
          voxel_offsets_flat, upsampled_shape, upsampled_pixel_size, lead_term,
          scattering_params_a) = batch_args 
     
         # Move tensors to CPU and ensure they're contiguous
         atom_indices_batch = atom_indices_batch.cpu().contiguous()
+        atom_dds_batch = atom_dds_batch.cpu().contiguous()
         voxel_offsets_flat = voxel_offsets_flat.cpu().contiguous()
         
         # Initialize local volume grid for this batch
@@ -478,13 +569,15 @@ def process_atom_batch(batch_args):
         # Add debug print to verify data
         print(f"Processing batch of size {len(atom_indices_batch)}")
         
+        #offset_test = upsampled_pixel_size/2
         # Process each atom in the batch
         for i in range(len(atom_indices_batch)):
             atom_pos = atom_indices_batch[i]
+            atom_dds = atom_dds_batch[i]
             atom_id = atoms_id_filtered_batch[i]  # This should now work with list indexing
             
             # Calculate voxel positions relative to atom center
-            voxel_positions = atom_pos.view(1, 3) + voxel_offsets_flat
+            voxel_positions = atom_pos.view(1, 3) + voxel_offsets_flat #indX/Y/Z equivalent
             
             #print(voxel_positions.shape)
             # Check bounds for each dimension separately
@@ -495,9 +588,9 @@ def process_atom_batch(batch_args):
             
             if valid_mask.any():
             # Calculate coordinates relative to atom center for potential calculation
-                relative_coords = ((voxel_positions[valid_mask] - atom_pos) * upsampled_pixel_size)
-                coords1 = relative_coords - (upsampled_pixel_size/2)
-                coords2 = relative_coords + (upsampled_pixel_size/2)
+                relative_coords = ((voxel_positions[valid_mask] - atom_pos - atom_dds - cisTEM_offset) * upsampled_pixel_size)
+                coords1 = relative_coords
+                coords2 = relative_coords + upsampled_pixel_size
             
             # Calculate potentials for valid positions
                 potentials = get_scattering_potential_of_voxel(
@@ -522,9 +615,10 @@ def process_atom_batch(batch_args):
             
     return local_volume
 
-def process_atoms_parallel(atom_indices, bPlusB, atoms_id_filtered, voxel_offsets_flat, upsampled_shape, upsampled_pixel_size, lead_term, n_cores):
+def process_atoms_parallel(atom_indices, atom_dds, bPlusB, atoms_id_filtered, voxel_offsets_flat, upsampled_shape, upsampled_pixel_size, lead_term, n_cores):
     # Ensure all inputs are on CPU and contiguous
     atom_indices = atom_indices.cpu().contiguous()
+    atom_dds = atom_dds.cpu().contiguous()
     voxel_offsets_flat = voxel_offsets_flat.cpu().contiguous()
 
     # Convert pandas Series to list if necessary
@@ -542,6 +636,7 @@ def process_atoms_parallel(atom_indices, bPlusB, atoms_id_filtered, voxel_offset
         end_idx = min(start_idx + batch_size, num_atoms)
         batch_args = (
             atom_indices[start_idx:end_idx],
+            atom_dds[start_idx:end_idx],
             bPlusB[start_idx:end_idx],
             atoms_id_filtered[start_idx:end_idx],
             voxel_offsets_flat,
@@ -665,6 +760,7 @@ def process_atoms_gpu(
 
 def process_atoms_gpu2(
         atom_indices: torch.Tensor,
+        atom_dds: torch.Tensor,
         bPlusB: torch.Tensor,
         atoms_id_filtered: list,
         voxel_offsets_flat: torch.Tensor,
@@ -673,6 +769,10 @@ def process_atoms_gpu2(
         lead_term: float,
         device: torch.device
 ):
+    # Ensure consistent dtype
+    atom_indices = atom_indices.to(torch.float32)
+    atom_dds = atom_dds.to(torch.float32)
+    bPlusB = bPlusB.to(torch.float32)
     # Pre-compute scattering parameters
     unique_atom_types = list(set(atoms_id_filtered))
     scattering_params = {
@@ -681,7 +781,7 @@ def process_atoms_gpu2(
     }
 
     # Initialize volume grid
-    volume_grid = torch.zeros(upsampled_shape, device=device)
+    volume_grid = torch.zeros(upsampled_shape, dtype=torch.float32, device=device)
 
     # Calculate optimal batch size based on GPU memory
     total_voxels = voxel_offsets_flat.shape[0]
@@ -699,6 +799,7 @@ def process_atoms_gpu2(
         
         # Get batch data
         batch_indices = atom_indices[start_idx:end_idx].to(device)
+        batch_atom_dds = atom_dds[start_idx:end_idx].to(device)
         batch_bPlusB = bPlusB[start_idx:end_idx].to(device)
         batch_atoms_id = atoms_id_filtered[start_idx:end_idx]
 
@@ -717,9 +818,11 @@ def process_atoms_gpu2(
 
             # Calculate positions for all atoms of this type at once
             atom_positions = batch_indices[type_indices]  # Shape: [n_atoms, 3]
+            atom_pos_dds = batch_atom_dds[type_indices]
             
             # Reshape for broadcasting
             atom_positions = atom_positions.view(n_atoms_of_type, 1, 3)  # Shape: [n_atoms, 1, 3]
+            atom_pos_dds = atom_pos_dds.view(n_atoms_of_type, 1, 3)  # Shape: [n_atoms, 1, 3]
             offsets = voxel_offsets_flat.to(device).view(1, -1, 3)  # Shape: [1, n_voxels, 3]
             
             # Calculate all voxel positions at once
@@ -732,13 +835,16 @@ def process_atoms_gpu2(
             valid_mask = valid_z & valid_y & valid_x  # Shape: [n_atoms, n_voxels]
 
             # Calculate relative coordinates for all valid positions
-            relative_coords = voxel_positions - atom_positions
+            offset_tensor = torch.full_like(voxel_positions, cisTEM_offset)
+            relative_coords = voxel_positions - atom_positions - atom_pos_dds - offset_tensor
             relative_coords = relative_coords * upsampled_pixel_size
             
             # Prepare coordinates for potential calculation
             valid_coords = relative_coords[valid_mask]
-            coords1 = valid_coords - (upsampled_pixel_size/2)
-            coords2 = valid_coords + (upsampled_pixel_size/2)
+            coords1 = valid_coords 
+            coords2 = valid_coords + upsampled_pixel_size
+            coords1 = coords1.to(torch.float32)
+            coords2 = coords2.to(torch.float32)
             
             # Get bPlusB for valid atoms
             valid_bPlusB = batch_bPlusB[type_indices][valid_mask.any(dim=1)]
@@ -827,7 +933,7 @@ def process_device_atoms(args):
     """
     Process atoms for a single device in parallel.
     """
-    (device_atom_indices, device_bPlusB, device_atoms_id, voxel_offsets_flat,
+    (device_atom_indices, device_atom_dds, device_bPlusB, device_atoms_id, voxel_offsets_flat,
      upsampled_shape, upsampled_pixel_size, lead_term, device, n_cpu_cores) = args
     
     print(f"\nProcessing atoms on {device}")
@@ -835,6 +941,7 @@ def process_device_atoms(args):
     if device.type == "cuda":
         volume_grid = process_atoms_gpu2(
             atom_indices=device_atom_indices.to(device),
+            atom_dds=device_atom_dds.to(device),
             bPlusB=device_bPlusB.to(device),
             atoms_id_filtered=device_atoms_id,
             voxel_offsets_flat=voxel_offsets_flat.to(device),
@@ -846,6 +953,7 @@ def process_device_atoms(args):
     else:
         volume_grid = process_atoms_parallel(
             atom_indices=device_atom_indices,
+            atom_dds=device_atom_dds,
             bPlusB=device_bPlusB,
             atoms_id_filtered=device_atoms_id,
             voxel_offsets_flat=voxel_offsets_flat,
@@ -856,6 +964,23 @@ def process_device_atoms(args):
         )
     
     return volume_grid
+
+def get_upsampling(wanted_pixel_size: float, wanted_output_size: int, MAX_3D_SIZE: int = 1536):
+    found_the_best_binning = False
+    upsampling = 1.0
+    # Check to make sure the sampling is sufficient, if not, oversample and bin at the end.
+    if wanted_pixel_size > 1.5:
+        if wanted_output_size * 4 < MAX_3D_SIZE:
+            print("\nOversampling your 3d by a factor of 4 for calculation.")
+            upsampling= 4.0
+            found_the_best_binning = True
+
+    if wanted_pixel_size > 0.75 and not found_the_best_binning:
+        if wanted_output_size * 2 < MAX_3D_SIZE:
+            print("\nOversampling your 3d by a factor of 2 for calculation.")
+            upsampling = 2.0
+
+    return int(upsampling)
 
 
 def simulate_3d_volume(
@@ -879,9 +1004,10 @@ def simulate_3d_volume(
     atoms_zyx, atoms_id, atoms_b_factor = load_model(pdb_filename, sim_pixel_spacing)
 
     # constants and stuff
-    b_scaling = 1
-    added_B = 10.0
+    b_scaling = 0.5
+    added_B = 0.0
     atoms_b_factor_scaled = 0.25 * (atoms_b_factor * b_scaling + added_B) # I'm not sure what the 0.25 is
+    #atoms_b_factor_scaled = (atoms_b_factor * b_scaling + added_B) # I'm not sure what the 0.25 is
     mean_b_factor = torch.mean(atoms_b_factor_scaled)
     # max_b_factor = torch.max(atoms_b_factor_scaled)
 
@@ -890,20 +1016,24 @@ def simulate_3d_volume(
     wavelength_A = wavelength * 1e10
 
     dose_weighting = True
-    num_frames = 30
+    num_frames = 50
     flux = 1
     dose_B = -1
-    apply_dqe = False
+    apply_dqe = True
 
     #setup a grid with half the pixel size and double desired shape
-    upsampling = 1
+    upsampling = get_upsampling(sim_pixel_spacing, sim_volume_shape[0])
     upsampled_pixel_size = sim_pixel_spacing / upsampling
     upsampled_shape = tuple(np.array(sim_volume_shape) * upsampling)
 
     #I'm making sure the index is on the edge of a voxel
-    origin_idx = (int(upsampled_shape[0] // 2), int(upsampled_shape[1] // 2), int(upsampled_shape[2] // 2))
+    #origin_idx = (int(upsampled_shape[0] // 2), int(upsampled_shape[1] // 2), int(upsampled_shape[2] // 2))
+    #cisTEM doesn't do this, it has origin as a float
+    origin_idx = (upsampled_shape[0] / 2, upsampled_shape[1] / 2, upsampled_shape[2] / 2)
 
-    lead_term = BOND_SCALING_FACTOR * wavelength_A / 8.0 / upsampled_pixel_size / upsampled_pixel_size
+
+    #lead_term = BOND_SCALING_FACTOR * wavelength_A / 8.0 / upsampled_pixel_size / upsampled_pixel_size
+    lead_term = BOND_SCALING_FACTOR * wavelength_A / 8.0 / (sim_pixel_spacing**2)
     #Not sure where the 8 comes from here
 
         # CisTEM does it like this though... I will use this for now
@@ -918,11 +1048,18 @@ def simulate_3d_volume(
 
     # Calculate atom indices in volume
     # Convert from centered Angstroms to voxel coordinates
+
     atom_indices = torch.zeros_like(atoms_zyx_filtered)
+    atom_dds = torch.zeros_like(atoms_zyx_filtered)
+    '''
     atom_indices[:, 0] = (atoms_zyx_filtered[:, 0] / upsampled_pixel_size) + origin_idx[0]  # z
     atom_indices[:, 1] = (atoms_zyx_filtered[:, 1] / upsampled_pixel_size) + origin_idx[1]  # y
     atom_indices[:, 2] = (atoms_zyx_filtered[:, 2] / upsampled_pixel_size) + origin_idx[2]  # x
     atom_indices = torch.round(atom_indices).int() # this is again the edge of the voxel
+    '''
+    this_coords = (atoms_zyx_filtered / upsampled_pixel_size) + torch.tensor(origin_idx).unsqueeze(0) + cisTEM_offset
+    atom_indices = torch.floor(this_coords)
+    atom_dds = this_coords - atom_indices - cisTEM_offset
 
     # Create coordinate grids for the neighborhood
     sz, sy, sx = torch.meshgrid(neighborhood_range, neighborhood_range, neighborhood_range, indexing='ij')
@@ -950,6 +1087,7 @@ def simulate_3d_volume(
         # If CPU only, use the original parallel processing directly
         volume_grid = process_atoms_parallel(
             atom_indices=atom_indices,
+            atom_dds=atom_dds,
             bPlusB=bPlusB,
             atoms_id_filtered=atoms_id_filtered,
             voxel_offsets_flat=voxel_offsets_flat,
@@ -968,6 +1106,7 @@ def simulate_3d_volume(
             
             # Get device-specific data
             device_atom_indices = atom_indices[start_idx:end_idx]
+            device_atom_dds = atom_dds[start_idx:end_idx]
             device_atoms_id = atoms_id_filtered[start_idx:end_idx]
             device_b_factor = atoms_b_factor_scaled_filtered[start_idx:end_idx]
             
@@ -976,7 +1115,7 @@ def simulate_3d_volume(
                               for atom_id in device_atoms_id])
             device_bPlusB = 2 * torch.pi / torch.sqrt(device_b_factor.unsqueeze(1) + b_params)
 
-            args = (device_atom_indices, device_bPlusB, device_atoms_id, voxel_offsets_flat,
+            args = (device_atom_indices, device_atom_dds, device_bPlusB, device_atoms_id, voxel_offsets_flat,
                upsampled_shape, upsampled_pixel_size, lead_term, device, n_cpu_cores)
             device_args.append(args)
         
@@ -991,18 +1130,88 @@ def simulate_3d_volume(
         final_volume += volume.to(main_device) 
 
     #Undo the upsanmpling here
+    '''
     # Bin the volume back to original size using 3D average pooling
     volume_grid_binned = torch.nn.functional.avg_pool3d(
         final_volume.unsqueeze(0),  # Add batch dimension
         kernel_size=upsampling,
         stride=upsampling
     ).squeeze(0)  # Remove batch dimension
+    '''
+    #Dose weight
+    final_volume = final_volume.cpu()
+    modify_signal = 1  # weird parameter here
+    if dose_weighting:
+        dose_filter = cumulative_dose_filter_3d(
+            volume=final_volume,
+            num_frames=num_frames,
+            start_exposure=0,
+            pixel_size=upsampled_pixel_size,
+            flux=flux,
+            Bfac=dose_B   
+        )
+        print(f"Dose filter min: {dose_filter.min()}, max: {dose_filter.max()}")
+        final_volume_FFT = torch.fft.rfftn(final_volume.contiguous(), dim=(-3, -2, -1))
+        
+        if modify_signal == 1:
+            # Add small epsilon to prevent division by zero
+            denominator = 1 + dose_filter
+            epsilon = 1e-10
+            denominator = torch.clamp(denominator, min=epsilon)
+            modification = (1-(1-dose_filter)/denominator)
+            
+            # Check for invalid values
+            if torch.any(torch.isnan(modification)):
+                print("Warning: NaN values in modification factor")
+                modification = torch.nan_to_num(modification, nan=1.0)
+                
+            final_volume_FFT *= modification
+        elif modify_signal == 2:
+            final_volume_FFT *= dose_filter**0.5
+        else:
+            final_volume_FFT *= dose_filter
+        
+        final_volume = torch.fft.irfftn(final_volume_FFT, dim=(-3, -2, -1))
+        # Check for NaN values in final result
+        if torch.any(torch.isnan(final_volume)):
+            print("Warning: NaN values in final volume")
 
+        #volume_grid_binned = dose_weight_3d_volume(
+        #    volume=volume_grid_binned,
+        #    num_frames=num_frames,
+        #    pixel_size=sim_pixel_spacing,
+        #    flux=flux,
+        #    Bfac=dose_B
+        #)
+    
+    if apply_dqe:
+        final_volume = apply_dqe_volume(
+            volume=final_volume,
+            dqe_parameters_a=DQE_PARAMETERS_A,
+            dqe_parameters_b=DQE_PARAMETERS_B,
+            dqe_parameters_c=DQE_PARAMETERS_C,
+            pixel_size=upsampled_pixel_size
+        )
+    
+    #fourier crop
+    '''
+    volume_grid_binned, _ = fourier_rescale_3d(
+        image=final_volume,
+        source_spacing=upsampled_pixel_size,
+        target_spacing=sim_pixel_spacing
+    )
+    '''
+    if upsampling > 1:
+        final_volume = fourier_rescale_3d_force_size(
+            volume=final_volume,
+            target_size=sim_volume_shape[0],
+        ) 
+    
     # I would then do any moodifications to volume grid here
 
     # Move to CPU only for final save
     # apply a dose filter if specified 
-    volume_grid_binned = volume_grid_binned.cpu()
+    #volume_grid_binned = volume_grid_binned.cpu()
 
     before_dw = time.time()
     elapsed_time = before_dw - start_time
@@ -1010,14 +1219,7 @@ def simulate_3d_volume(
     seconds = int(elapsed_time % 60)
     print(f"Before dw simulation time: {minutes} minutes {seconds} seconds")
 
-    if dose_weighting:
-        volume_grid_binned = dose_weight_3d_volume(
-            volume=volume_grid_binned,
-            num_frames=num_frames,
-            pixel_size=sim_pixel_spacing,
-            flux=flux,
-            Bfac=dose_B
-    )
+
         
     after_dw = time.time()
     elapsed_time = after_dw - start_time
@@ -1026,8 +1228,8 @@ def simulate_3d_volume(
     print(f"After dw simulation time: {minutes} minutes {seconds} seconds")
     # Apply a DQE if specified 
 
-    mrcfile.write("simulated_volume_dw_us1.mrc", 
-                  volume_grid_binned.numpy(), overwrite=True)
+    mrcfile.write("simulated_volume_dw_us2_cpu.mrc", 
+                  final_volume.numpy(), overwrite=True)
 
     end_time = time.time()
     elapsed_time = end_time - start_time
